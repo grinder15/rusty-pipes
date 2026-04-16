@@ -290,7 +290,11 @@ fn spawn_audio_processing_thread<P>(
         let mut active_tremulants_ids: HashMap<String, bool> = HashMap::new();
         let mut tremulant_lfos: HashMap<String, TremulantLfo> = HashMap::new();
         let mut prev_windchest_mods: HashMap<String, f32> = HashMap::new();
-        let mut scratch_read_buffer: Vec<f32> = vec![0.0; buffer_size_frames * CHANNEL_COUNT * 2];
+        // Worst-case: needed_frames = ceil(buffer_size_frames * pitch_max) + 2, and
+        // to_read = min(available, needed_frames * 2). Sized for pitch_max = 2.0 (well
+        // beyond any realistic tremulant modulation) so resize never fires on the audio thread.
+        let scratch_capacity = (buffer_size_frames * 2 + 2) * 2 * CHANNEL_COUNT;
+        let mut scratch_read_buffer: Vec<f32> = vec![0.0; scratch_capacity];
         let mut audio_recorder: Option<AudioRecorder> = None;
 
         loop {
@@ -516,9 +520,7 @@ fn spawn_audio_processing_thread<P>(
 
                 if to_read > 0 {
                     let read_samples = to_read * CHANNEL_COUNT;
-                    if scratch_read_buffer.len() < read_samples {
-                        scratch_read_buffer.resize(read_samples, 0.0);
-                    }
+                    debug_assert!(read_samples <= scratch_read_buffer.len());
                     let _ = voice
                         .consumer
                         .pop_slice(&mut scratch_read_buffer[..read_samples]);

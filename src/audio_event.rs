@@ -300,16 +300,20 @@ pub fn process_message(
             }
         }
         AppMessage::StopMidiRecording => {
-            let mut guard = shared_midi_recorder.lock().unwrap();
-            if let Some(recorder) = guard.take() {
-                match recorder.save() {
+            // Take the recorder under a short-held lock, then drop the lock before
+            // doing any file I/O — otherwise we'd block the audio thread on disk.
+            let recorder_opt = shared_midi_recorder.lock().unwrap().take();
+            if let Some(recorder) = recorder_opt {
+                let tui_tx_bg = tui_tx.clone();
+                thread::spawn(move || match recorder.save() {
                     Ok(path) => {
-                        let _ = tui_tx.send(TuiMessage::MidiLog(format!("Saved: {}", path)));
+                        let _ = tui_tx_bg.send(TuiMessage::MidiLog(format!("Saved: {}", path)));
                     }
                     Err(e) => {
-                        let _ = tui_tx.send(TuiMessage::Error(format!("MIDI Save Error: {}", e)));
+                        let _ =
+                            tui_tx_bg.send(TuiMessage::Error(format!("MIDI Save Error: {}", e)));
                     }
-                }
+                });
             }
         }
         AppMessage::SetReverbWetDry(r) => *wet_dry_ratio = r.clamp(0.0, 1.0),

@@ -199,18 +199,22 @@ impl AppState {
     }
 
     pub fn persist_settings(&self) {
-        // Load existing settings to preserve other fields (like devices)
-        let mut settings = load_settings().unwrap_or_default();
+        // Snapshot the fields we want to persist, then perform load+save off-thread.
+        // Callers typically hold the AppState mutex while invoking this; doing disk I/O
+        // synchronously here would block the audio thread, REST handlers, and the UI.
+        let gain = self.gain;
+        let polyphony = self.polyphony;
+        let lcd_displays = self.lcd_displays.clone();
 
-        // Update values
-        settings.gain = self.gain;
-        settings.polyphony = self.polyphony;
-        settings.lcd_displays = self.lcd_displays.clone();
-
-        // Save back to disk
-        if let Err(e) = save_settings(&settings) {
-            log::error!("Failed to persist settings: {}", e);
-        }
+        std::thread::spawn(move || {
+            let mut settings = load_settings().unwrap_or_default();
+            settings.gain = gain;
+            settings.polyphony = polyphony;
+            settings.lcd_displays = lcd_displays;
+            if let Err(e) = save_settings(&settings) {
+                log::error!("Failed to persist settings: {}", e);
+            }
+        });
     }
 
     pub fn modify_gain(&mut self, delta: f32, audio_tx: &Sender<AppMessage>) {
@@ -334,23 +338,33 @@ impl AppState {
             .unwrap_or_else(Default::default) // Return an empty bank [None; 12] if not found
     }
 
-    /// Saves the entire configuration map back to the JSON file.
+    /// Saves the entire configuration map back to the JSON file. Disk I/O happens
+    /// in a background thread so callers (typically holding the AppState mutex) don't
+    /// block the audio thread, REST handlers, or the UI.
     fn save_all_presets_to_file(&self) -> Result<()> {
         let preset_path = get_preset_file_path();
-        // Load the entire config file (all organs)
-        let mut config: PresetConfig = File::open(preset_path.clone())
-            .map_err(anyhow::Error::from)
-            .and_then(|file| {
-                serde_json::from_reader(BufReader::new(file)).map_err(anyhow::Error::from)
-            })
-            .unwrap_or_default(); // Create a new map if it doesn't exist
+        let organ_name = self.organ.name.clone();
+        let presets = self.presets.clone();
 
-        // Update or insert the preset bank for the current organ
-        config.insert(self.organ.name.clone(), self.presets.clone());
+        std::thread::spawn(move || {
+            let mut config: PresetConfig = File::open(&preset_path)
+                .map_err(anyhow::Error::from)
+                .and_then(|file| {
+                    serde_json::from_reader(BufReader::new(file)).map_err(anyhow::Error::from)
+                })
+                .unwrap_or_default();
 
-        // Write the entire config file back to disk
-        let file = File::create(preset_path)?;
-        serde_json::to_writer_pretty(BufWriter::new(file), &config)?;
+            config.insert(organ_name, presets);
+
+            let result = File::create(&preset_path).and_then(|f| {
+                serde_json::to_writer_pretty(BufWriter::new(f), &config)
+                    .map_err(std::io::Error::other)
+            });
+
+            if let Err(e) = result {
+                log::error!("Failed to save presets to {:?}: {}", preset_path, e);
+            }
+        });
 
         Ok(())
     }
