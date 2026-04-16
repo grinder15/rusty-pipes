@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#1d2025" />
+    <title>Rusty Pipes</title>
+    <link rel="stylesheet" href="/ui/app.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-left">
+        <span id="status-dot" class="status-dot connecting" title="Connecting…"></span>
+        <h1 id="organ-name">Rusty Pipes</h1>
+      </div>
+      <nav class="tabs" role="tablist">
+        <button class="tab" data-tab="presets" role="tab" aria-selected="true">Presets</button>
+        <button class="tab" data-tab="stops" role="tab">Stops</button>
+        <button class="tab" data-tab="tremulants" role="tab">Tremulants</button>
+        <button class="tab" data-tab="audio" role="tab">Audio</button>
+        <button class="tab" data-tab="recording" role="tab">Recording</button>
+        <button class="tab" data-tab="organs" role="tab">Organs</button>
+      </nav>
+      <div class="topbar-right">
+        <button id="panic-btn" class="danger" title="All Notes Off">PANIC</button>
+      </div>
+    </header>
+
+    <main class="content">
+      <!-- PRESETS -->
+      <section id="tab-presets" class="tab-panel active">
+        <div class="panel-header">
+          <h2>Presets</h2>
+          <p class="muted">Tap a preset to load. Long-press (or right-click) to save or learn a MIDI trigger.</p>
+        </div>
+        <div id="preset-grid" class="preset-grid"></div>
+      </section>
+
+      <!-- STOPS -->
+      <section id="tab-stops" class="tab-panel">
+        <div class="panel-header">
+          <h2>Stops</h2>
+          <div class="row">
+            <label for="stop-channel-select">Channel:</label>
+            <select id="stop-channel-select"></select>
+            <span class="muted small">All toggle actions affect this channel.</span>
+          </div>
+        </div>
+        <div id="stops-container" class="stops-container"></div>
+      </section>
+
+      <!-- TREMULANTS -->
+      <section id="tab-tremulants" class="tab-panel">
+        <div class="panel-header">
+          <h2>Tremulants</h2>
+          <p class="muted">Tap to toggle. Long-press to learn an enable/disable trigger.</p>
+        </div>
+        <div id="tremulant-grid" class="tile-grid"></div>
+      </section>
+
+      <!-- AUDIO -->
+      <section id="tab-audio" class="tab-panel">
+        <div class="panel-header"><h2>Audio</h2></div>
+
+        <div class="card">
+          <h3>Master Gain</h3>
+          <div class="slider-row">
+            <input type="range" id="gain-slider" min="0" max="2" step="0.01" value="0" />
+            <span id="gain-value" class="slider-value">0.00</span>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>Polyphony</h3>
+          <div class="slider-row">
+            <input type="range" id="polyphony-slider" min="16" max="512" step="16" value="128" />
+            <span id="polyphony-value" class="slider-value">128</span>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>Reverb</h3>
+          <div class="row">
+            <label for="reverb-select">Impulse Response:</label>
+            <select id="reverb-select"></select>
+          </div>
+          <div class="slider-row">
+            <label for="reverb-mix-slider">Mix:</label>
+            <input type="range" id="reverb-mix-slider" min="0" max="1" step="0.01" value="0" />
+            <span id="reverb-mix-value" class="slider-value">0.00</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ORGANS -->
+      <section id="tab-organs" class="tab-panel">
+        <div class="panel-header">
+          <h2>Organs</h2>
+          <p class="muted">Tap an organ to load it. The application will reload, briefly disconnecting the web UI.</p>
+        </div>
+        <div id="organ-list" class="organ-list"></div>
+      </section>
+
+      <!-- RECORDING -->
+      <section id="tab-recording" class="tab-panel">
+        <div class="panel-header"><h2>Recording</h2></div>
+        <div class="card">
+          <button id="record-midi-btn" class="big-toggle">● Start MIDI Recording</button>
+          <p class="muted small">Saves a .mid file alongside settings on stop.</p>
+        </div>
+        <div class="card">
+          <button id="record-audio-btn" class="big-toggle">● Start Audio Recording</button>
+          <p class="muted small">Saves a stereo .wav file on stop.</p>
+        </div>
+      </section>
+    </main>
+
+    <!-- Toasts -->
+    <div id="toast-container" aria-live="polite"></div>
+
+    <!-- Save Preset Modal -->
+    <div id="modal-save-preset" class="modal hidden" role="dialog" aria-modal="true">
+      <div class="modal-card">
+        <h3>Save Preset</h3>
+        <p class="muted">Slot <span id="save-preset-slot">-</span></p>
+        <input type="text" id="save-preset-name" maxlength="60" placeholder="Preset name" />
+        <div class="modal-actions">
+          <button class="ghost" data-modal-close>Cancel</button>
+          <button id="save-preset-confirm" class="primary">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Preset Action Modal (mobile-friendly long-press) -->
+    <div id="modal-preset-actions" class="modal hidden" role="dialog" aria-modal="true">
+      <div class="modal-card">
+        <h3 id="preset-actions-title">Preset</h3>
+        <div class="modal-actions stack">
+          <button id="preset-action-load" class="primary">Load</button>
+          <button id="preset-action-save">Save current to this slot…</button>
+          <button id="preset-action-learn">MIDI Learn trigger</button>
+          <button id="preset-action-clear" class="warn">Clear MIDI binding</button>
+          <button class="ghost" data-modal-close>Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Stop Action Modal -->
+    <div id="modal-stop-actions" class="modal hidden" role="dialog" aria-modal="true">
+      <div class="modal-card">
+        <h3 id="stop-actions-title">Stop</h3>
+        <p class="muted small" id="stop-actions-subtitle"></p>
+        <div class="modal-actions stack">
+          <button id="stop-action-learn-enable">MIDI Learn — Enable</button>
+          <button id="stop-action-learn-disable">MIDI Learn — Disable</button>
+          <button id="stop-action-clear" class="warn">Clear MIDI bindings</button>
+          <button class="ghost" data-modal-close>Close</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Tremulant Action Modal -->
+    <div id="modal-tremulant-actions" class="modal hidden" role="dialog" aria-modal="true">
+      <div class="modal-card">
+        <h3 id="tremulant-actions-title">Tremulant</h3>
+        <div class="modal-actions stack">
+          <button id="trem-action-learn-enable">MIDI Learn — Enable</button>
+          <button id="trem-action-learn-disable">MIDI Learn — Disable</button>
+          <button id="trem-action-clear" class="warn">Clear MIDI bindings</button>
+          <button class="ghost" data-modal-close>Close</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- MIDI Learn Modal -->
+    <div id="modal-learn" class="modal hidden" role="dialog" aria-modal="true">
+      <div class="modal-card">
+        <h3>MIDI Learn</h3>
+        <p class="muted" id="learn-target-label">—</p>
+        <div class="learn-indicator">
+          <span class="pulse"></span>
+          <span id="learn-state-label">Waiting for MIDI event…</span>
+        </div>
+        <p id="learn-result" class="muted small"></p>
+        <div class="modal-actions">
+          <button id="learn-cancel" class="ghost">Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="/ui/app.js"></script>
+  </body>
+</html>
