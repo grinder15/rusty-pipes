@@ -564,6 +564,12 @@ fn main() -> Result<()> {
             active_layout,
         )?));
 
+        // Broadcast channel for pushing state-change hints to web clients.
+        // The capacity is generous since each message is tiny and the audio
+        // thread should never block on a slow subscriber.
+        let (ws_broadcaster, _) = tokio::sync::broadcast::channel::<app::WsMessage>(256);
+        app_state.lock().unwrap().ws_broadcaster = Some(ws_broadcaster.clone());
+
         // --- Initialize MIDI Output & LCDs ---
         {
             let mut state = app_state.lock().unwrap();
@@ -594,6 +600,7 @@ fn main() -> Result<()> {
             audio_tx.clone(),
             args.api_server_port,
             exit_action.clone(),
+            ws_broadcaster,
         );
 
         // --- Spawn the dedicated MIDI logic thread ---

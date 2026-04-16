@@ -1,5 +1,5 @@
 use crate::{
-    app::{AppMessage, TuiMessage},
+    app::{AppMessage, TuiMessage, WsMessage},
     config::{LcdDisplayConfig, MidiDeviceConfig, MidiEventSpec, load_settings, save_settings},
     input::KeyboardLayout,
     midi,
@@ -7,6 +7,8 @@ use crate::{
     midi_recorder::MidiRecorder,
     organ::Organ,
 };
+
+use tokio::sync::broadcast;
 
 use anyhow::Result;
 use midir::{MidiInput, MidiInputConnection, MidiInputPort, MidiOutputConnection};
@@ -112,6 +114,9 @@ pub struct AppState {
 
     // LCD Helpers
     pub last_recalled_preset_name: String,
+    /// 1-based slot of the most recently recalled preset, if any. Used by
+    /// the web UI to highlight the active preset tile.
+    pub last_recalled_preset_slot: Option<usize>,
     pub last_stop_change_name: String,
 
     pub midi_seek_tx: Option<Sender<i32>>, // Sends seconds to skip (+15 or -15)
@@ -120,6 +125,38 @@ pub struct AppState {
     // LCD / MIDI Out
     pub midi_out: Vec<MidiOutputConnection>,
     pub lcd_displays: Vec<LcdDisplayConfig>,
+
+    /// Active MIDI-learn session initiated from the web UI. The REST poll
+    /// handler resolves it when a new MIDI event arrives.
+    pub web_learn_session: Option<WebLearnSession>,
+
+    /// Broadcast channel used to push state-change hints to connected web
+    /// clients. None when no API server is running.
+    pub ws_broadcaster: Option<broadcast::Sender<WsMessage>>,
+}
+
+/// A learn session driven by the REST API (web UI).
+#[derive(Debug, Clone)]
+pub struct WebLearnSession {
+    pub target: WebLearnTarget,
+    pub target_name: String,
+    pub started_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub enum WebLearnTarget {
+    Stop {
+        stop_index: usize,
+        channel: u8,
+        is_enable: bool,
+    },
+    Tremulant {
+        id: String,
+        is_enable: bool,
+    },
+    Preset {
+        slot_index: usize,
+    },
 }
 
 pub fn get_preset_file_path() -> PathBuf {
@@ -184,12 +221,24 @@ impl AppState {
             midi_current_time_secs: 0,
             midi_total_time_secs: 0,
             last_recalled_preset_name: "None".to_string(),
+            last_recalled_preset_slot: None,
             last_stop_change_name: "None".to_string(),
             midi_seek_tx: None,
             last_sysex: None,
             midi_out: Vec::new(),
             lcd_displays: Vec::new(),
+            web_learn_session: None,
+            ws_broadcaster: None,
         })
+    }
+
+    /// Push a hint to every connected web client. No-op if no broadcaster is
+    /// installed. `send` returns Err only when there are no subscribers,
+    /// which is fine — the message is simply discarded.
+    pub fn ws_broadcast(&self, msg: WsMessage) {
+        if let Some(tx) = &self.ws_broadcaster {
+            let _ = tx.send(msg);
+        }
     }
 
     // Helper to calculate the actual MIDI note
@@ -222,6 +271,7 @@ impl AppState {
         let _ = audio_tx.send(AppMessage::SetGain(self.gain));
         self.persist_settings();
         self.refresh_lcds();
+        self.ws_broadcast(WsMessage::AudioChanged);
     }
 
     pub fn refresh_lcds(&mut self) {
@@ -305,6 +355,7 @@ impl AppState {
         let _ = audio_tx.send(AppMessage::SetPolyphony(self.polyphony));
         self.persist_settings();
         self.refresh_lcds();
+        self.ws_broadcast(WsMessage::AudioChanged);
     }
 
     pub fn set_tremulant_active(
@@ -319,6 +370,7 @@ impl AppState {
             self.active_tremulants.remove(&trem_id);
         }
         let _ = audio_tx.send(AppMessage::SetTremulantActive(trem_id, active));
+        self.ws_broadcast(WsMessage::TremulantsChanged);
     }
 
     /// Loads the MIDI channel mapping preset bank for the specified organ from the JSON file.
@@ -615,6 +667,7 @@ impl AppState {
             self.last_stop_change_name = self.get_stop_activity_label(active) + &stop.name.clone();
         }
         self.refresh_lcds();
+        self.ws_broadcast(WsMessage::StopsChanged);
 
         Ok(())
     }
@@ -727,6 +780,7 @@ impl AppState {
                 self.get_stop_activity_label(is_active) + &stop.name.clone();
         }
         self.refresh_lcds();
+        self.ws_broadcast(WsMessage::StopsChanged);
 
         Ok(())
     }
@@ -751,6 +805,7 @@ impl AppState {
             self.last_stop_change_name = self.get_stop_activity_label(true) + &stop.name.clone();
         }
         self.refresh_lcds();
+        self.ws_broadcast(WsMessage::StopsChanged);
 
         Ok(())
     }
@@ -793,6 +848,7 @@ impl AppState {
             self.last_stop_change_name = self.get_stop_activity_label(false) + &stop.name.clone();
         }
         self.refresh_lcds();
+        self.ws_broadcast(WsMessage::StopsChanged);
 
         Ok(())
     }
@@ -870,6 +926,7 @@ impl AppState {
             self.add_midi_log(format!("ERROR saving presets: {}", e));
         }
         self.refresh_lcds();
+        self.ws_broadcast(WsMessage::PresetsChanged);
     }
 
     /// Recalls a preset from a slot into `stop_channels`.
@@ -945,7 +1002,10 @@ impl AppState {
 
                 log::info!("Recalled preset from slot F{}", slot + 1);
                 self.last_recalled_preset_name = format!("F{}: {}", slot + 1, _preset_name);
+                self.last_recalled_preset_slot = Some(slot + 1);
                 self.add_midi_log(format!("Recalled preset F{}", slot + 1));
+                self.ws_broadcast(WsMessage::StopsChanged);
+                self.ws_broadcast(WsMessage::PresetsChanged);
             } else {
                 // This can happen if the organ definition file changed
                 let err_msg = format!(

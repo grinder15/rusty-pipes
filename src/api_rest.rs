@@ -1,17 +1,19 @@
 use actix_web::dev::ServerHandle;
-use actix_web::{App, HttpResponse, HttpServer, Responder, web};
+use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, web};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
+use tokio::sync::broadcast;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
-use crate::app::AppMessage;
-use crate::app::MainLoopAction;
-use crate::app_state::AppState;
-use crate::config::{self, load_organ_library};
+use crate::app::{AppMessage, MainLoopAction, WsMessage};
+use crate::app_state::{AppState, WebLearnSession, WebLearnTarget};
+use crate::config::{self, MidiEventSpec, load_organ_library};
 
 /// A handle that controls the lifecycle of the API Server.
 /// When this struct is dropped, the server shuts down and the background thread exits.
@@ -48,6 +50,46 @@ pub struct StopStatusResponse {
     name: String,
     /// List of active internal virtual channels (0-15) for this stop
     active_channels: Vec<u8>,
+    /// Division (manual) identifier from the underlying organ definition,
+    /// e.g. "GO" (Great), "SW" (Swell), "P" (Pedal). Empty if unknown.
+    division: String,
+}
+
+#[derive(Serialize, Clone, ToSchema)]
+pub struct PresetSlotResponse {
+    /// 1-based slot number (1..=12)
+    slot: usize,
+    /// Preset name if occupied; None for empty slots
+    name: Option<String>,
+    occupied: bool,
+    /// True if this slot was the most recently recalled preset.
+    is_last_loaded: bool,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct MidiLearnStartRequest {
+    /// "stop", "tremulant", or "preset"
+    target: String,
+    /// Required for "stop"
+    stop_index: Option<usize>,
+    /// Required for "stop": virtual channel 0-15
+    channel: Option<u8>,
+    /// Required for "stop" and "tremulant": true to learn the enable
+    /// trigger, false to learn the disable trigger
+    is_enable: Option<bool>,
+    /// Required for "tremulant"
+    tremulant_id: Option<String>,
+    /// Required for "preset": 1-based slot id
+    preset_slot: Option<usize>,
+}
+
+#[derive(Serialize, Clone, ToSchema)]
+pub struct MidiLearnStatusResponse {
+    /// "idle", "waiting", "captured", or "timed_out"
+    state: String,
+    target_name: Option<String>,
+    /// Human-readable description of the captured event, populated once state == "captured"
+    event_description: Option<String>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -132,6 +174,11 @@ struct ApiData {
     // We need access to the exit action mutex to trigger organ reload
     exit_action: Arc<Mutex<MainLoopAction>>,
     reverb_files: Arc<Vec<(String, PathBuf)>>,
+    ws_tx: broadcast::Sender<WsMessage>,
+}
+
+fn broadcast(data: &web::Data<ApiData>, msg: WsMessage) {
+    let _ = data.ws_tx.send(msg);
 }
 
 // --- OpenAPI Documentation ---
@@ -142,10 +189,11 @@ struct ApiData {
         get_organ_info,
         get_organ_library,
         load_organ,
-        get_stops, 
+        get_stops,
         panic,
         update_stop_channel,
-        load_preset, 
+        get_presets,
+        load_preset,
         save_preset,
         get_audio_settings,
         set_gain,
@@ -156,23 +204,32 @@ struct ApiData {
         set_reverb,
         set_reverb_mix,
         get_tremulants,
-        set_tremulant
+        set_tremulant,
+        midi_learn_start,
+        midi_learn_status,
+        midi_learn_cancel,
+        clear_stop_binding,
+        clear_tremulant_binding,
+        clear_preset_binding
     ),
     components(
         schemas(
-            StopStatusResponse, 
-            ChannelUpdateRequest, 
+            StopStatusResponse,
+            ChannelUpdateRequest,
             OrganInfoResponse,
             OrganEntryResponse,
             LoadOrganRequest,
             PresetSaveRequest,
+            PresetSlotResponse,
             ValueRequest,
             ReverbRequest,
             ReverbMixRequest,
             ReverbEntry,
             AudioSettingsResponse,
             TremulantResponse,
-            TremulantSetRequest
+            TremulantSetRequest,
+            MidiLearnStartRequest,
+            MidiLearnStatusResponse
         )
     ),
     tags(
@@ -259,6 +316,7 @@ async fn load_organ(body: web::Json<LoadOrganRequest>, data: web::Data<ApiData>)
         };
 
         let _ = data.audio_tx.send(AppMessage::Quit);
+        broadcast(&data, WsMessage::OrganChanged);
 
         HttpResponse::Ok().json(serde_json::json!({"status": "reloading", "organ": profile.name}))
     } else {
@@ -298,10 +356,18 @@ async fn get_stops(data: web::Data<ApiData>) -> impl Responder {
             .unwrap_or_default();
         active_channels.sort();
 
+        let division = stop
+            .rank_ids
+            .first()
+            .and_then(|rid| state.organ.ranks.get(rid))
+            .map(|r| r.division_id.clone())
+            .unwrap_or_default();
+
         response_list.push(StopStatusResponse {
             index: i,
             name: stop.name.clone(),
             active_channels,
+            division,
         });
     }
     HttpResponse::Ok().json(response_list)
@@ -427,11 +493,15 @@ async fn get_audio_settings(data: web::Data<ApiData>) -> impl Responder {
     responses((status = 200))
 )]
 async fn set_gain(body: web::Json<ValueRequest>, data: web::Data<ApiData>) -> impl Responder {
-    let mut state = data.app_state.lock().unwrap();
-    state.gain = body.value.clamp(0.0, 2.0);
-    let _ = data.audio_tx.send(AppMessage::SetGain(state.gain));
-    state.persist_settings();
-    HttpResponse::Ok().json(serde_json::json!({"status": "success", "gain": state.gain}))
+    let gain = {
+        let mut state = data.app_state.lock().unwrap();
+        state.gain = body.value.clamp(0.0, 2.0);
+        let _ = data.audio_tx.send(AppMessage::SetGain(state.gain));
+        state.persist_settings();
+        state.gain
+    };
+    broadcast(&data, WsMessage::AudioChanged);
+    HttpResponse::Ok().json(serde_json::json!({"status": "success", "gain": gain}))
 }
 
 /// Set Polyphony limit (minimum 1).
@@ -441,13 +511,17 @@ async fn set_gain(body: web::Json<ValueRequest>, data: web::Data<ApiData>) -> im
     responses((status = 200))
 )]
 async fn set_polyphony(body: web::Json<ValueRequest>, data: web::Data<ApiData>) -> impl Responder {
-    let mut state = data.app_state.lock().unwrap();
-    state.polyphony = (body.value as usize).max(1);
-    let _ = data
-        .audio_tx
-        .send(AppMessage::SetPolyphony(state.polyphony));
-    state.persist_settings();
-    HttpResponse::Ok().json(serde_json::json!({"status": "success", "polyphony": state.polyphony}))
+    let polyphony = {
+        let mut state = data.app_state.lock().unwrap();
+        state.polyphony = (body.value as usize).max(1);
+        let _ = data
+            .audio_tx
+            .send(AppMessage::SetPolyphony(state.polyphony));
+        state.persist_settings();
+        state.polyphony
+    };
+    broadcast(&data, WsMessage::AudioChanged);
+    HttpResponse::Ok().json(serde_json::json!({"status": "success", "polyphony": polyphony}))
 }
 
 /// Start or Stop MIDI Recording.
@@ -460,17 +534,20 @@ async fn start_stop_midi_recording(
     body: web::Json<ChannelUpdateRequest>,
     data: web::Data<ApiData>,
 ) -> impl Responder {
-    let mut state = data.app_state.lock().unwrap();
-    state.is_recording_midi = body.active;
-    if body.active {
-        let _ = data.audio_tx.send(AppMessage::StartMidiRecording);
-        state.add_midi_log("API: Started MIDI Recording".into());
-    } else {
-        let _ = data.audio_tx.send(AppMessage::StopMidiRecording);
-        state.add_midi_log("API: Stopped MIDI Recording".into());
+    let active = body.active;
+    {
+        let mut state = data.app_state.lock().unwrap();
+        state.is_recording_midi = active;
+        if active {
+            let _ = data.audio_tx.send(AppMessage::StartMidiRecording);
+            state.add_midi_log("API: Started MIDI Recording".into());
+        } else {
+            let _ = data.audio_tx.send(AppMessage::StopMidiRecording);
+            state.add_midi_log("API: Stopped MIDI Recording".into());
+        }
     }
-    HttpResponse::Ok()
-        .json(serde_json::json!({"status": "success", "recording_midi": state.is_recording_midi}))
+    broadcast(&data, WsMessage::AudioChanged);
+    HttpResponse::Ok().json(serde_json::json!({"status": "success", "recording_midi": active}))
 }
 
 /// Start or Stop Audio (WAV) Recording.
@@ -483,17 +560,20 @@ async fn start_stop_audio_recording(
     body: web::Json<ChannelUpdateRequest>,
     data: web::Data<ApiData>,
 ) -> impl Responder {
-    let mut state = data.app_state.lock().unwrap();
-    state.is_recording_audio = body.active;
-    if body.active {
-        let _ = data.audio_tx.send(AppMessage::StartAudioRecording);
-        state.add_midi_log("API: Started Audio Recording".into());
-    } else {
-        let _ = data.audio_tx.send(AppMessage::StopAudioRecording);
-        state.add_midi_log("API: Stopped Audio Recording".into());
+    let active = body.active;
+    {
+        let mut state = data.app_state.lock().unwrap();
+        state.is_recording_audio = active;
+        if active {
+            let _ = data.audio_tx.send(AppMessage::StartAudioRecording);
+            state.add_midi_log("API: Started Audio Recording".into());
+        } else {
+            let _ = data.audio_tx.send(AppMessage::StopAudioRecording);
+            state.add_midi_log("API: Stopped Audio Recording".into());
+        }
     }
-    HttpResponse::Ok()
-        .json(serde_json::json!({"status": "success", "recording_audio": state.is_recording_audio}))
+    broadcast(&data, WsMessage::AudioChanged);
+    HttpResponse::Ok().json(serde_json::json!({"status": "success", "recording_audio": active}))
 }
 
 /// Get available Impulse Response (Reverb) files.
@@ -522,12 +602,15 @@ async fn get_reverbs(data: web::Data<ApiData>) -> impl Responder {
 )]
 async fn set_reverb(body: web::Json<ReverbRequest>, data: web::Data<ApiData>) -> impl Responder {
     let idx = body.index;
-    let mut state = data.app_state.lock().unwrap();
 
     if idx < 0 {
-        state.selected_reverb_index = None;
-        let _ = data.audio_tx.send(AppMessage::SetReverbWetDry(0.0));
-        state.persist_settings();
+        {
+            let mut state = data.app_state.lock().unwrap();
+            state.selected_reverb_index = None;
+            let _ = data.audio_tx.send(AppMessage::SetReverbWetDry(0.0));
+            state.persist_settings();
+        }
+        broadcast(&data, WsMessage::AudioChanged);
         return HttpResponse::Ok().json(serde_json::json!({"status": "disabled"}));
     }
 
@@ -537,14 +620,17 @@ async fn set_reverb(body: web::Json<ReverbRequest>, data: web::Data<ApiData>) ->
     }
 
     let (name, path) = &data.reverb_files[u_idx];
-    state.selected_reverb_index = Some(u_idx);
-    let _ = data.audio_tx.send(AppMessage::SetReverbIr(path.clone()));
-    let _ = data
-        .audio_tx
-        .send(AppMessage::SetReverbWetDry(state.reverb_mix));
-
-    state.persist_settings();
-    state.add_midi_log(format!("API: Reverb set to '{}'", name));
+    {
+        let mut state = data.app_state.lock().unwrap();
+        state.selected_reverb_index = Some(u_idx);
+        let _ = data.audio_tx.send(AppMessage::SetReverbIr(path.clone()));
+        let _ = data
+            .audio_tx
+            .send(AppMessage::SetReverbWetDry(state.reverb_mix));
+        state.persist_settings();
+        state.add_midi_log(format!("API: Reverb set to '{}'", name));
+    }
+    broadcast(&data, WsMessage::AudioChanged);
 
     HttpResponse::Ok().json(serde_json::json!({"status": "success", "reverb": name}))
 }
@@ -559,13 +645,17 @@ async fn set_reverb_mix(
     body: web::Json<ReverbMixRequest>,
     data: web::Data<ApiData>,
 ) -> impl Responder {
-    let mut state = data.app_state.lock().unwrap();
-    state.reverb_mix = body.mix.clamp(0.0, 1.0);
-    let _ = data
-        .audio_tx
-        .send(AppMessage::SetReverbWetDry(state.reverb_mix));
-    state.persist_settings();
-    HttpResponse::Ok().json(serde_json::json!({"status": "success", "mix": state.reverb_mix}))
+    let mix = {
+        let mut state = data.app_state.lock().unwrap();
+        state.reverb_mix = body.mix.clamp(0.0, 1.0);
+        let _ = data
+            .audio_tx
+            .send(AppMessage::SetReverbWetDry(state.reverb_mix));
+        state.persist_settings();
+        state.reverb_mix
+    };
+    broadcast(&data, WsMessage::AudioChanged);
+    HttpResponse::Ok().json(serde_json::json!({"status": "success", "mix": mix}))
 }
 
 /// Get list of Tremulants and their status.
@@ -621,6 +711,419 @@ async fn set_tremulant(
     HttpResponse::Ok().json(serde_json::json!({"status": "success"}))
 }
 
+/// Lists all 12 preset slots with their names (if any) and occupied state.
+#[utoipa::path(
+    get, path = "/presets", tag = "Presets",
+    responses((status = 200, body = Vec<PresetSlotResponse>))
+)]
+async fn get_presets(data: web::Data<ApiData>) -> impl Responder {
+    let state = data.app_state.lock().unwrap();
+    let last_loaded = state.last_recalled_preset_slot;
+    let mut list = Vec::with_capacity(state.presets.len());
+    for (i, slot) in state.presets.iter().enumerate() {
+        let slot_num = i + 1;
+        list.push(PresetSlotResponse {
+            slot: slot_num,
+            name: slot.as_ref().map(|p| p.name.clone()),
+            occupied: slot.is_some(),
+            is_last_loaded: last_loaded == Some(slot_num),
+        });
+    }
+    HttpResponse::Ok().json(list)
+}
+
+fn describe_event(event: &MidiEventSpec) -> String {
+    match event {
+        MidiEventSpec::Note {
+            channel,
+            note,
+            is_note_off,
+        } => format!(
+            "Ch{} Note {} ({})",
+            channel + 1,
+            note,
+            if *is_note_off { "Off" } else { "On" }
+        ),
+        MidiEventSpec::SysEx(bytes) => {
+            let hex: Vec<String> = bytes.iter().map(|b| format!("{:02X}", b)).collect();
+            format!("SysEx: {}", hex.join(" "))
+        }
+    }
+}
+
+const WEB_LEARN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Begins a web-driven MIDI learn session. Only one session can be active
+/// at a time; starting a new one cancels the previous.
+#[utoipa::path(
+    post, path = "/midi-learn/start", tag = "MIDI Learn",
+    request_body = MidiLearnStartRequest,
+    responses((status = 200, body = MidiLearnStatusResponse), (status = 400), (status = 404))
+)]
+async fn midi_learn_start(
+    body: web::Json<MidiLearnStartRequest>,
+    data: web::Data<ApiData>,
+) -> impl Responder {
+    let mut state = data.app_state.lock().unwrap();
+
+    let (target, target_name) = match body.target.as_str() {
+        "stop" => {
+            let stop_index = match body.stop_index {
+                Some(i) => i,
+                None => return HttpResponse::BadRequest().body("stop_index is required"),
+            };
+            let channel = match body.channel {
+                Some(c) if c <= 15 => c,
+                _ => return HttpResponse::BadRequest().body("channel (0-15) is required"),
+            };
+            let is_enable = body.is_enable.unwrap_or(true);
+            let stop_name = match state.organ.stops.get(stop_index) {
+                Some(s) => s.name.clone(),
+                None => return HttpResponse::NotFound().body("Stop not found"),
+            };
+            let label = format!(
+                "Stop '{}' Ch{} ({})",
+                stop_name,
+                channel + 1,
+                if is_enable { "Enable" } else { "Disable" }
+            );
+            (
+                WebLearnTarget::Stop {
+                    stop_index,
+                    channel,
+                    is_enable,
+                },
+                label,
+            )
+        }
+        "tremulant" => {
+            let id = match body.tremulant_id.clone() {
+                Some(s) => s,
+                None => return HttpResponse::BadRequest().body("tremulant_id is required"),
+            };
+            if !state.organ.tremulants.contains_key(&id) {
+                return HttpResponse::NotFound().body("Tremulant not found");
+            }
+            let is_enable = body.is_enable.unwrap_or(true);
+            let label = format!(
+                "Tremulant '{}' ({})",
+                id,
+                if is_enable { "Enable" } else { "Disable" }
+            );
+            (
+                WebLearnTarget::Tremulant { id, is_enable },
+                label,
+            )
+        }
+        "preset" => {
+            let slot = match body.preset_slot {
+                Some(s) if (1..=12).contains(&s) => s,
+                _ => return HttpResponse::BadRequest().body("preset_slot must be 1..=12"),
+            };
+            (
+                WebLearnTarget::Preset {
+                    slot_index: slot - 1,
+                },
+                format!("Preset F{}", slot),
+            )
+        }
+        other => {
+            return HttpResponse::BadRequest()
+                .body(format!("Unknown target type: {}", other));
+        }
+    };
+
+    state.web_learn_session = Some(WebLearnSession {
+        target,
+        target_name: target_name.clone(),
+        started_at: Instant::now(),
+    });
+    drop(state);
+
+    broadcast(
+        &data,
+        WsMessage::MidiLearn {
+            state: "waiting".into(),
+            target_name: Some(target_name.clone()),
+            event_description: None,
+        },
+    );
+
+    HttpResponse::Ok().json(MidiLearnStatusResponse {
+        state: "waiting".into(),
+        target_name: Some(target_name),
+        event_description: None,
+    })
+}
+
+/// Returns the status of the current web MIDI-learn session. If a MIDI event
+/// has been received since the session started, the binding is persisted and
+/// the session transitions to "captured" before being cleared.
+#[utoipa::path(
+    get, path = "/midi-learn", tag = "MIDI Learn",
+    responses((status = 200, body = MidiLearnStatusResponse))
+)]
+/// Inspects the active learn session and resolves it if a MIDI event has
+/// arrived since the session started, or if the timeout has elapsed. Returns
+/// a status response when the session transitioned (captured / timed_out);
+/// returns None when nothing changed.
+fn tick_learn_session(state: &mut AppState) -> Option<MidiLearnStatusResponse> {
+    let session = state.web_learn_session.as_ref()?.clone();
+
+    if session.started_at.elapsed() > WEB_LEARN_TIMEOUT {
+        state.web_learn_session = None;
+        return Some(MidiLearnStatusResponse {
+            state: "timed_out".into(),
+            target_name: Some(session.target_name),
+            event_description: None,
+        });
+    }
+
+    let event = state
+        .last_midi_event_received
+        .as_ref()
+        .filter(|(_, t)| *t > session.started_at)
+        .map(|(e, _)| e.clone())?;
+
+    let description = describe_event(&event);
+    let organ_name = state.organ.name.clone();
+    match &session.target {
+        WebLearnTarget::Stop {
+            stop_index,
+            channel,
+            is_enable,
+        } => {
+            state
+                .midi_control_map
+                .learn_stop(*stop_index, *channel, event, *is_enable);
+        }
+        WebLearnTarget::Tremulant { id, is_enable } => {
+            state
+                .midi_control_map
+                .learn_tremulant(id.clone(), event, *is_enable);
+        }
+        WebLearnTarget::Preset { slot_index } => {
+            state.midi_control_map.learn_preset(*slot_index, event);
+        }
+    }
+    let _ = state.midi_control_map.save(&organ_name);
+    state.add_midi_log(format!(
+        "Web MIDI Learn: {} -> {}",
+        session.target_name, description
+    ));
+    state.web_learn_session = None;
+
+    Some(MidiLearnStatusResponse {
+        state: "captured".into(),
+        target_name: Some(session.target_name),
+        event_description: Some(description),
+    })
+}
+
+/// Returns the status of the current web MIDI-learn session. The web client
+/// normally receives this via the WebSocket; this endpoint is also useful as
+/// a fallback or for non-WS clients.
+#[utoipa::path(
+    get, path = "/midi-learn", tag = "MIDI Learn",
+    responses((status = 200, body = MidiLearnStatusResponse))
+)]
+async fn midi_learn_status(data: web::Data<ApiData>) -> impl Responder {
+    let resp = {
+        let mut state = data.app_state.lock().unwrap();
+        if let Some(transitioned) = tick_learn_session(&mut state) {
+            transitioned
+        } else if let Some(s) = &state.web_learn_session {
+            MidiLearnStatusResponse {
+                state: "waiting".into(),
+                target_name: Some(s.target_name.clone()),
+                event_description: None,
+            }
+        } else {
+            MidiLearnStatusResponse {
+                state: "idle".into(),
+                target_name: None,
+                event_description: None,
+            }
+        }
+    };
+
+    if resp.state == "captured" || resp.state == "timed_out" {
+        broadcast(
+            &data,
+            WsMessage::MidiLearn {
+                state: resp.state.clone(),
+                target_name: resp.target_name.clone(),
+                event_description: resp.event_description.clone(),
+            },
+        );
+    }
+
+    HttpResponse::Ok().json(resp)
+}
+
+/// Clears the learned MIDI binding for a stop+channel pair. Removes both
+/// enable and disable triggers if present. Idempotent.
+#[utoipa::path(
+    delete, path = "/midi-bindings/stop/{stop_index}/{channel}", tag = "MIDI Learn",
+    params(
+        ("stop_index" = usize, Path, description = "Index of the stop"),
+        ("channel" = u8, Path, description = "Virtual MIDI Channel (0-15)")
+    ),
+    responses((status = 200))
+)]
+async fn clear_stop_binding(
+    path: web::Path<(usize, u8)>,
+    data: web::Data<ApiData>,
+) -> impl Responder {
+    let (stop_index, channel) = path.into_inner();
+    if channel > 15 {
+        return HttpResponse::BadRequest().body("Channel ID > 15");
+    }
+    let mut state = data.app_state.lock().unwrap();
+    state.midi_control_map.clear_stop(stop_index, channel);
+    let organ_name = state.organ.name.clone();
+    let _ = state.midi_control_map.save(&organ_name);
+    state.add_midi_log(format!(
+        "Cleared MIDI binding for stop {} ch {}",
+        stop_index,
+        channel + 1
+    ));
+    HttpResponse::Ok().json(serde_json::json!({"status": "cleared"}))
+}
+
+/// Clears the learned MIDI binding for a tremulant.
+#[utoipa::path(
+    delete, path = "/midi-bindings/tremulant/{trem_id}", tag = "MIDI Learn",
+    params(("trem_id" = String, Path, description = "Tremulant ID")),
+    responses((status = 200))
+)]
+async fn clear_tremulant_binding(
+    path: web::Path<String>,
+    data: web::Data<ApiData>,
+) -> impl Responder {
+    let trem_id = path.into_inner();
+    let mut state = data.app_state.lock().unwrap();
+    state.midi_control_map.clear_tremulant(&trem_id);
+    let organ_name = state.organ.name.clone();
+    let _ = state.midi_control_map.save(&organ_name);
+    state.add_midi_log(format!("Cleared MIDI binding for tremulant '{}'", trem_id));
+    HttpResponse::Ok().json(serde_json::json!({"status": "cleared"}))
+}
+
+/// Clears the learned MIDI binding for a preset slot (1-based).
+#[utoipa::path(
+    delete, path = "/midi-bindings/preset/{slot}", tag = "MIDI Learn",
+    params(("slot" = usize, Path, description = "Preset slot ID (1-12)")),
+    responses((status = 200), (status = 400))
+)]
+async fn clear_preset_binding(
+    path: web::Path<usize>,
+    data: web::Data<ApiData>,
+) -> impl Responder {
+    let slot = path.into_inner();
+    if !(1..=12).contains(&slot) {
+        return HttpResponse::BadRequest().body("Invalid slot");
+    }
+    let mut state = data.app_state.lock().unwrap();
+    state.midi_control_map.clear_preset(slot - 1);
+    let organ_name = state.organ.name.clone();
+    let _ = state.midi_control_map.save(&organ_name);
+    state.add_midi_log(format!("Cleared MIDI binding for preset F{}", slot));
+    HttpResponse::Ok().json(serde_json::json!({"status": "cleared"}))
+}
+
+/// Cancels any active web MIDI-learn session.
+#[utoipa::path(
+    post, path = "/midi-learn/cancel", tag = "MIDI Learn",
+    responses((status = 200))
+)]
+async fn midi_learn_cancel(data: web::Data<ApiData>) -> impl Responder {
+    {
+        let mut state = data.app_state.lock().unwrap();
+        state.web_learn_session = None;
+    }
+    broadcast(
+        &data,
+        WsMessage::MidiLearn {
+            state: "idle".into(),
+            target_name: None,
+            event_description: None,
+        },
+    );
+    HttpResponse::Ok().json(serde_json::json!({"status": "cancelled"}))
+}
+
+// --- WebSocket ---
+
+/// WebSocket endpoint that streams state-change hints to the connected
+/// client. Each broadcast message is forwarded as a single JSON text frame.
+async fn ws_handler(
+    req: HttpRequest,
+    stream: web::Payload,
+    data: web::Data<ApiData>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let (response, mut session, mut msg_stream) = actix_ws::handle(&req, stream)?;
+    let mut rx = data.ws_tx.subscribe();
+
+    actix_web::rt::spawn(async move {
+        loop {
+            tokio::select! {
+                ws_msg = msg_stream.next() => match ws_msg {
+                    Some(Ok(actix_ws::Message::Ping(b))) => {
+                        if session.pong(&b).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(actix_ws::Message::Close(reason))) => {
+                        let _ = session.close(reason).await;
+                        break;
+                    }
+                    Some(Err(_)) | None => break,
+                    _ => {}
+                },
+                bcast = rx.recv() => match bcast {
+                    Ok(msg) => {
+                        if let Ok(json) = serde_json::to_string(&msg) {
+                            if session.text(json).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    // If we lagged, just keep going — the client refetches state.
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                },
+            }
+        }
+    });
+
+    Ok(response)
+}
+
+// --- Embedded Web UI ---
+
+const WEB_UI_HTML: &str = include_str!("../assets/web/index.html");
+const WEB_UI_CSS: &str = include_str!("../assets/web/app.css");
+const WEB_UI_JS: &str = include_str!("../assets/web/app.js");
+
+async fn web_ui_index() -> impl Responder {
+    HttpResponse::Ok()
+        .content_type("text/html; charset=utf-8")
+        .body(WEB_UI_HTML)
+}
+
+async fn web_ui_css() -> impl Responder {
+    HttpResponse::Ok()
+        .content_type("text/css; charset=utf-8")
+        .body(WEB_UI_CSS)
+}
+
+async fn web_ui_js() -> impl Responder {
+    HttpResponse::Ok()
+        .content_type("application/javascript; charset=utf-8")
+        .body(WEB_UI_JS)
+}
+
 // --- Server Launcher ---
 
 pub fn start_api_server(
@@ -628,8 +1131,37 @@ pub fn start_api_server(
     audio_tx: Sender<AppMessage>,
     port: u16,
     exit_action: Arc<Mutex<MainLoopAction>>,
+    ws_tx: broadcast::Sender<WsMessage>,
 ) -> ApiServerHandle {
     let reverb_files = Arc::new(config::get_available_ir_files());
+
+    // Background ticker: detects MIDI-learn captures driven by external MIDI
+    // input and broadcasts the transition to web clients. Runs until the
+    // process exits.
+    {
+        let ticker_state = app_state.clone();
+        let ticker_ws = ws_tx.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_millis(100));
+                let resp_opt = {
+                    let mut state = ticker_state.lock().unwrap();
+                    if state.web_learn_session.is_some() {
+                        tick_learn_session(&mut state)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(resp) = resp_opt {
+                    let _ = ticker_ws.send(WsMessage::MidiLearn {
+                        state: resp.state,
+                        target_name: resp.target_name,
+                        event_description: resp.event_description,
+                    });
+                }
+            }
+        });
+    }
 
     // Create a channel to send the ServerHandle from the background thread back to here
     let (tx, rx) = mpsc::channel();
@@ -642,6 +1174,7 @@ pub fn start_api_server(
             audio_tx,
             exit_action,
             reverb_files,
+            ws_tx,
         });
 
         let openapi = ApiDoc::openapi();
@@ -654,6 +1187,13 @@ pub fn start_api_server(
                         .url("/api-docs/openapi.json", openapi.clone()),
                 )
                 .route("/", web::get().to(index))
+                // Embedded Web UI
+                .route("/ui", web::get().to(web_ui_index))
+                .route("/ui/", web::get().to(web_ui_index))
+                .route("/ui/app.css", web::get().to(web_ui_css))
+                .route("/ui/app.js", web::get().to(web_ui_js))
+                // Live updates
+                .route("/ws", web::get().to(ws_handler))
                 // General
                 .route("/organ", web::get().to(get_organ_info))
                 .route("/organs", web::get().to(get_organ_library))
@@ -666,6 +1206,7 @@ pub fn start_api_server(
                     web::post().to(update_stop_channel),
                 )
                 // Presets
+                .route("/presets", web::get().to(get_presets))
                 .route("/presets/{slot_id}/load", web::post().to(load_preset))
                 .route("/presets/{slot_id}/save", web::post().to(save_preset))
                 // Audio
@@ -681,12 +1222,29 @@ pub fn start_api_server(
                 // Tremulants
                 .route("/tremulants", web::get().to(get_tremulants))
                 .route("/tremulants/{trem_id}", web::post().to(set_tremulant))
+                // MIDI Learn (web flow)
+                .route("/midi-learn", web::get().to(midi_learn_status))
+                .route("/midi-learn/start", web::post().to(midi_learn_start))
+                .route("/midi-learn/cancel", web::post().to(midi_learn_cancel))
+                .route(
+                    "/midi-bindings/stop/{stop_index}/{channel}",
+                    web::delete().to(clear_stop_binding),
+                )
+                .route(
+                    "/midi-bindings/tremulant/{trem_id}",
+                    web::delete().to(clear_tremulant_binding),
+                )
+                .route(
+                    "/midi-bindings/preset/{slot}",
+                    web::delete().to(clear_preset_binding),
+                )
         })
         .bind(("0.0.0.0", port));
 
         match server {
             Ok(bound_server) => {
                 println!("REST API server listening on http://0.0.0.0:{}", port);
+                println!("Web UI available at http://0.0.0.0:{}/ui/", port);
                 println!(
                     "Swagger UI available at http://0.0.0.0:{}/swagger-ui/",
                     port

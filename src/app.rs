@@ -1,6 +1,25 @@
+use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::time::Instant;
+
+/// Change hints broadcast to connected web clients. The server sends a hint
+/// and the client refetches the relevant REST endpoint — this avoids having
+/// to serialize full state over the wire and keeps the REST API authoritative.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type")]
+pub enum WsMessage {
+    StopsChanged,
+    PresetsChanged,
+    TremulantsChanged,
+    AudioChanged,
+    OrganChanged,
+    MidiLearn {
+        state: String,
+        target_name: Option<String>,
+        event_description: Option<String>,
+    },
+}
 
 /// Messages sent from the TUI and MIDI threads to the Audio thread.
 #[derive(Debug)]
