@@ -240,11 +240,11 @@ struct ApiDoc;
 
 // --- Handlers ---
 
-/// Redirects to Swagger UI
-#[utoipa::path(get, path = "/", responses((status = 302, description = "Redirect to Swagger")))]
+/// Redirects to the embedded web UI.
+#[utoipa::path(get, path = "/", responses((status = 302, description = "Redirect to web UI")))]
 async fn index() -> impl Responder {
     HttpResponse::Found()
-        .append_header(("Location", "/swagger-ui/"))
+        .append_header(("Location", "/ui/"))
         .finish()
 }
 
