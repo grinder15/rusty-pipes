@@ -3,6 +3,7 @@ use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, web};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -19,11 +20,20 @@ use crate::config::{self, MidiEventSpec, load_organ_library};
 /// When this struct is dropped, the server shuts down and the background thread exits.
 pub struct ApiServerHandle {
     handle: ServerHandle,
+    /// Signals the MIDI-learn ticker thread to exit. Without this, every
+    /// call to `start_api_server` (e.g. on organ reload) would leak a new
+    /// ticker thread that holds a strong reference to the old `AppState`,
+    /// pinning the old organ's sample data in memory.
+    ticker_stop: Arc<AtomicBool>,
 }
 
 impl Drop for ApiServerHandle {
     fn drop(&mut self) {
         println!("Stopping API Server...");
+        // Tell the ticker thread to exit at its next wake-up. It holds a
+        // clone of Arc<Mutex<AppState>>, so releasing it is required for
+        // the old AppState (and therefore Arc<Organ>) to be freed.
+        self.ticker_stop.store(true, Ordering::Release);
         let handle = self.handle.clone();
 
         // Actix's stop() method is async, but Drop is sync.
@@ -1169,14 +1179,20 @@ pub fn start_api_server(
     let reverb_files = Arc::new(config::get_available_ir_files());
 
     // Background ticker: detects MIDI-learn captures driven by external MIDI
-    // input and broadcasts the transition to web clients. Runs until the
-    // process exits.
+    // input and broadcasts the transition to web clients. Exits when
+    // ApiServerHandle is dropped (e.g. on organ reload), which prevents
+    // stale tickers from leaking Arc<Mutex<AppState>> across reloads.
+    let ticker_stop = Arc::new(AtomicBool::new(false));
     {
         let ticker_state = app_state.clone();
         let ticker_ws = ws_tx.clone();
+        let ticker_stop = ticker_stop.clone();
         std::thread::spawn(move || {
-            loop {
+            while !ticker_stop.load(Ordering::Acquire) {
                 std::thread::sleep(Duration::from_millis(100));
+                if ticker_stop.load(Ordering::Acquire) {
+                    break;
+                }
                 let resp_opt = {
                     let mut state = ticker_state.lock().unwrap();
                     if state.web_learn_session.is_some() {
@@ -1193,6 +1209,7 @@ pub fn start_api_server(
                     });
                 }
             }
+            log::info!("[ApiTicker] Stop signal received. Exiting.");
         });
     }
 
@@ -1297,5 +1314,8 @@ pub fn start_api_server(
         .recv()
         .expect("Failed to start API server or receive handle");
 
-    ApiServerHandle { handle }
+    ApiServerHandle {
+        handle,
+        ticker_stop,
+    }
 }
