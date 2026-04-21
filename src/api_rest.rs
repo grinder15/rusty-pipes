@@ -378,12 +378,18 @@ async fn get_stops(data: web::Data<ApiData>) -> impl Responder {
             .unwrap_or_default();
         active_channels.sort();
 
-        let division = stop
-            .rank_ids
-            .first()
-            .and_then(|rid| state.organ.ranks.get(rid))
-            .map(|r| r.division_id.clone())
-            .unwrap_or_default();
+        // Prefer the division recorded on the stop itself (populated by the
+        // organ loaders). Fall back to the first rank's division when the
+        // stop doesn't carry one, which keeps older code paths working.
+        let division = if !stop.division_id.is_empty() {
+            stop.division_id.clone()
+        } else {
+            stop.rank_ids
+                .first()
+                .and_then(|rid| state.organ.ranks.get(rid))
+                .map(|r| r.division_id.clone())
+                .unwrap_or_default()
+        };
 
         response_list.push(StopStatusResponse {
             index: i,

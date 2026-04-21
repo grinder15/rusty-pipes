@@ -35,6 +35,9 @@ pub struct Stop {
     pub name: String,
     pub id_str: String,        // e.g., "013"
     pub rank_ids: Vec<String>, // IDs of ranks it triggers
+    /// Division/register prefix for grouping (e.g. "HW", "SW", "P").
+    /// Empty when the organ format doesn't carry division metadata.
+    pub division_id: String,
 }
 
 /// Represents a rank (a set of pipes).

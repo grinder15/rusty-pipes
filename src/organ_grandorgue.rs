@@ -23,6 +23,29 @@ impl NonEmpty for String {
     }
 }
 
+/// Infers a division prefix from a stop name. GrandOrgue organs don't
+/// carry division metadata, but sample-set authors commonly prefix stop
+/// names with an abbreviation like "HW Principal 8'" or "P Subbaß 16'".
+/// Returns an empty string when no recognised prefix is found.
+fn infer_division_from_name(name: &str) -> String {
+    // Keep in sync with the labels in assets/web/app.js::DIVISION_LABELS
+    // and organ_hauptwerk.rs::get_division_prefix. Longest-first so
+    // "Pos" isn't shadowed by "P".
+    const PREFIXES: &[&str] = &["HW", "SW", "Pos", "BW", "OW", "So", "SL", "P"];
+    let trimmed = name.trim_start();
+    for p in PREFIXES {
+        if let Some(rest) = trimmed.strip_prefix(p) {
+            // Require a separator after the prefix so "Subbaß" doesn't
+            // match "S" etc. This also excludes stops like "Principal"
+            // from being bucketed under the "P" pedal prefix.
+            if rest.starts_with(|c: char| c.is_whitespace() || c == '.' || c == ':') {
+                return (*p).to_string();
+            }
+        }
+    }
+    String::new()
+}
+
 /// Helper to get a clean organ name from a file path
 fn get_organ_name(path: &Path) -> String {
     path.file_stem()
@@ -1023,12 +1046,14 @@ where
                 }
             }
             if !rank_ids.is_empty() {
+                let division_id = infer_division_from_name(&name);
                 stops_map.insert(
                     id_str.clone(),
                     Stop {
                         name,
                         id_str,
                         rank_ids,
+                        division_id,
                     },
                 );
             }

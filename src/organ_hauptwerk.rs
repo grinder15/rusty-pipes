@@ -1185,6 +1185,7 @@ pub fn load_hauptwerk(
                 name: final_name,
                 id_str: xs.id,
                 rank_ids,
+                division_id: prefix,
             },
         );
     }

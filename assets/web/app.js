@@ -207,13 +207,31 @@ async function loadStops() {
   renderStops();
 }
 
+// Human-friendly labels for the division/register IDs produced by the
+// organ loaders (see organ_hauptwerk.rs::get_division_prefix).
+const DIVISION_LABELS = {
+  HW: "Hauptwerk",
+  SW: "Swell",
+  Pos: "Positiv",
+  BW: "Brustwerk",
+  OW: "Oberwerk",
+  So: "Solo",
+  P: "Pedal",
+};
+
+function divisionLabel(id) {
+  if (!id) return "Stops";
+  const friendly = DIVISION_LABELS[id];
+  return friendly ? `${friendly} (${id})` : id;
+}
+
 function renderStops() {
   const container = document.getElementById("stops-container");
   container.innerHTML = "";
   // Group by division (preserving stop order)
   const groups = new Map();
   state.stops.forEach((s) => {
-    const key = s.division || "—";
+    const key = s.division || "";
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(s);
   });
@@ -222,7 +240,7 @@ function renderStops() {
     const section = document.createElement("section");
     section.className = "division";
     const h = document.createElement("h3");
-    h.textContent = division === "—" ? "Stops" : division;
+    h.textContent = divisionLabel(division);
     section.appendChild(h);
 
     const grid = document.createElement("div");

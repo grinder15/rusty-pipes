@@ -271,16 +271,18 @@ button {
 .division {
   background: var(--bg-elev);
   border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
   border-radius: var(--radius);
-  padding: 0.8rem;
+  padding: 0.8rem 0.9rem 1rem;
 }
 .division h3 {
-  margin: 0 0 0.6rem;
-  font-size: 0.9rem;
+  margin: 0 0 0.7rem;
+  padding-bottom: 0.5rem;
+  font-size: 1rem;
   font-weight: 700;
-  color: var(--text-dim);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  color: var(--accent);
+  letter-spacing: 0.06em;
+  border-bottom: 1px solid var(--border);
 }
 
 .stop-grid {

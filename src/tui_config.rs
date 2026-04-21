@@ -681,38 +681,39 @@ fn draw_config_ui(frame: &mut Frame, state: &mut TuiConfigState) {
     }
 
     // --- Calculate header height ---
-    let logo_lines_count = LOGO.lines().count();
-    let header_height = (logo_lines_count + 5) as u16;
+    let pipes_lines_count = LOGO.lines().count();
+    let header_height = (pipes_lines_count + 5) as u16;
 
     // --- Main Layout ---
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(header_height), // Logo + Title
+            Constraint::Length(header_height), // Pipes + Title
             Constraint::Min(0),                // Config List
             Constraint::Length(3),             // Help/Error
         ])
         .split(area);
 
-    // --- Build the logo header ---
+    // --- Build the header ---
     let orange_style = Style::default().fg(Color::Rgb(255, 165, 0));
+    let gray_style = Style::default().fg(Color::Gray);
     let white_style = Style::default().fg(Color::White);
 
-    let mut logo_lines_vec: Vec<Line> = Vec::new();
-    for line in LOGO.lines() {
-        logo_lines_vec.push(Line::from(Span::styled(line, orange_style)));
-    }
-    logo_lines_vec.push(Line::from(Span::styled(
+    let mut header_lines: Vec<Line> = LOGO
+        .lines()
+        .map(|line| Line::from(Span::styled(line, gray_style)))
+        .collect();
+    header_lines.push(Line::from(Span::styled(
         t!("config.subtitle"),
         orange_style,
     )));
-    logo_lines_vec.push(Line::from("")); // Blank line
-    logo_lines_vec.push(Line::from(Span::styled(
+    header_lines.push(Line::from("")); // Blank line
+    header_lines.push(Line::from(Span::styled(
         t!("tui_config.header_title"),
         white_style.add_modifier(Modifier::BOLD),
     )));
 
-    let title_widget = Paragraph::new(logo_lines_vec)
+    let title_widget = Paragraph::new(header_lines)
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL));
 
