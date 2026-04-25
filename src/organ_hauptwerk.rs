@@ -638,16 +638,28 @@ pub fn load_hauptwerk(
     let get_division_prefix = |div_id: &str| -> String {
         if let Some(name) = division_name_map.get(div_id) {
             let n = name.to_lowercase();
-            if n.contains("pedal") {
+            if n.contains("pedal") || n.contains("pédale") || n.contains("pedale") {
                 return "P".to_string();
             }
             if n.contains("hauptwerk") || n.contains("great") {
                 return "HW".to_string();
             }
-            if n.contains("schwell") || n.contains("swell") {
+            if n.contains("grand orgue")
+                || n.contains("grand'orgue")
+                || n.contains("grand organo")
+                || n.contains("grand'organo")
+                || n.contains("grande organo")
+                || n.contains("grand'organo")
+            {
+                return "GO".to_string();
+            }
+            if n.contains("schwell") || n.contains("swell") || n.contains("récit") || n.contains("recit") {
                 return "SW".to_string();
             }
-            if n.contains("positiv") || n.contains("choir") {
+            if n.contains("positivo tergale") {
+                return "PT".to_string();
+            }
+            if n.contains("positiv") || n.contains("positif") || n.contains("positivo") || n.contains("choir") {
                 return "Pos".to_string();
             }
             if n.contains("brust") {

@@ -208,7 +208,8 @@ async function loadStops() {
 }
 
 // Human-friendly labels for the division/register IDs produced by the
-// organ loaders (see organ_hauptwerk.rs::get_division_prefix).
+// organ loaders (see organ_hauptwerk.rs::get_division_prefix and
+// organ_grandorgue.rs::infer_division_from_name).
 const DIVISION_LABELS = {
   HW: "Hauptwerk",
   SW: "Swell",
@@ -217,12 +218,39 @@ const DIVISION_LABELS = {
   OW: "Oberwerk",
   So: "Solo",
   P: "Pedal",
+  Ped: "Pedal",
+  GO: "Grand'Organo",
+  PT: "Positivo Tergale",
+  Gt: "Great",
+  Ch: "Choir",
 };
 
 function divisionLabel(id) {
   if (!id) return "Stops";
   const friendly = DIVISION_LABELS[id];
   return friendly ? `${friendly} (${id})` : id;
+}
+
+// When stops are grouped under a division header, the division prefix
+// embedded in the stop name (e.g. "P  Subbasso 16'") is redundant. Strip
+// it for the visible label only — the canonical name is preserved in
+// stop.name and the tooltip.
+function stopDisplayName(stop) {
+  const div = stop.division;
+  const name = stop.name || "";
+  if (!div) return name;
+  const trimmed = name.trimStart();
+  if (trimmed.startsWith(div)) {
+    const rest = trimmed.slice(div.length);
+    if (rest.length === 0) return name;
+    const sep = rest.charCodeAt(0);
+    // Only strip when the prefix is followed by whitespace or punctuation,
+    // to avoid mangling names like "Pos Trompete" vs "Posaune".
+    if (sep === 32 || sep === 9 || rest[0] === "." || rest[0] === ":") {
+      return rest.replace(/^[\s.:]+/, "");
+    }
+  }
+  return name;
 }
 
 function renderStops() {
@@ -251,7 +279,7 @@ function renderStops() {
       tile.className = "stop-tile";
       const isActive = stop.active_channels.includes(state.channel);
       if (isActive) tile.classList.add("active");
-      tile.textContent = stop.name;
+      tile.textContent = stopDisplayName(stop);
       tile.title = `${stop.name} (idx ${stop.index}, ${stop.division || "?"})`;
 
       bindActivation(tile, {

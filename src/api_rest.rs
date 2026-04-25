@@ -1149,6 +1149,47 @@ async fn ws_handler(
     Ok(response)
 }
 
+// --- Listen-address discovery ---
+
+/// Returns the list of IP addresses the web UI can be reached at, with
+/// loopback (127.0.0.1) first followed by the addresses of every up
+/// network interface. Sorted so IPv4 comes before IPv6 within each group.
+fn list_listen_addresses() -> Vec<std::net::IpAddr> {
+    use std::net::{IpAddr, Ipv4Addr};
+    let mut out: Vec<IpAddr> = vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))];
+    if let Ok(addrs) = local_ip_address::list_afinet_netifas() {
+        let mut iface: Vec<IpAddr> = addrs
+            .into_iter()
+            .map(|(_name, ip)| ip)
+            .filter(|ip| !ip.is_loopback() && !ip.is_unspecified())
+            .filter(|ip| match ip {
+                // Drop link-local IPv6 (fe80::) — they need a scope id
+                // and aren't useful for connecting to the web UI.
+                IpAddr::V6(v6) => {
+                    let s = v6.segments();
+                    !(s[0] & 0xffc0 == 0xfe80)
+                }
+                IpAddr::V4(_) => true,
+            })
+            .collect();
+        iface.sort_by_key(|ip| match ip {
+            IpAddr::V4(_) => 0,
+            IpAddr::V6(_) => 1,
+        });
+        iface.dedup();
+        out.extend(iface);
+    }
+    out
+}
+
+/// Format an IP address for inclusion in a URL (wraps IPv6 in brackets).
+fn format_host(ip: &std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) => format!("[{}]", v6),
+    }
+}
+
 // --- Embedded Web UI ---
 
 const WEB_UI_HTML: &str = include_str!("../assets/web/index.html");
@@ -1299,12 +1340,16 @@ pub fn start_api_server(
 
         match server {
             Ok(bound_server) => {
-                println!("REST API server listening on http://0.0.0.0:{}", port);
-                println!("Web UI available at http://0.0.0.0:{}/ui/", port);
-                println!(
-                    "Swagger UI available at http://0.0.0.0:{}/swagger-ui/",
-                    port
-                );
+                let addrs = list_listen_addresses();
+                println!("REST API server listening on port {}.", port);
+                println!("Web UI available at:");
+                for addr in &addrs {
+                    println!("  http://{}:{}/ui/", format_host(addr), port);
+                }
+                println!("Swagger UI available at:");
+                for addr in &addrs {
+                    println!("  http://{}:{}/swagger-ui/", format_host(addr), port);
+                }
                 let server = bound_server.run();
                 let handle = server.handle();
                 let _ = tx.send(handle);

@@ -30,8 +30,10 @@ impl NonEmpty for String {
 fn infer_division_from_name(name: &str) -> String {
     // Keep in sync with the labels in assets/web/app.js::DIVISION_LABELS
     // and organ_hauptwerk.rs::get_division_prefix. Longest-first so
-    // "Pos" isn't shadowed by "P".
-    const PREFIXES: &[&str] = &["HW", "SW", "Pos", "BW", "OW", "So", "SL", "P"];
+    // "Pos" isn't shadowed by "P", "PT" not by "P", "GO" before "G".
+    const PREFIXES: &[&str] = &[
+        "HW", "SW", "Pos", "BW", "OW", "So", "SL", "PT", "GO", "Gt", "Ch", "Ped", "P",
+    ];
     let trimmed = name.trim_start();
     for p in PREFIXES {
         if let Some(rest) = trimmed.strip_prefix(p) {
