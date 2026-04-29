@@ -51,6 +51,9 @@ pub enum AppMessage {
     StopAudioRecording,
     StartMidiRecording,
     StopMidiRecording,
+    /// Hint that a stop just became active. Audio thread enqueues warmup
+    /// loads for every pipe in that stop's ranks.
+    WarmupStop(usize),
     /// TUI quit event.
     Quit,
 }

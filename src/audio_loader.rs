@@ -8,6 +8,8 @@ use std::time::Duration;
 
 use crate::voice::{CHANNEL_COUNT, SpawnJob};
 use crate::wav::{WavSampleReader, parse_smpl_chunk, parse_wav_metadata};
+use crate::wav_mmap::MmapSample;
+use std::sync::Arc;
 
 /// Worker function that loads samples from disk or cache and fills the ring buffer.
 pub fn run_loader_job(mut job: SpawnJob) {
@@ -23,6 +25,21 @@ pub fn run_loader_job(mut job: SpawnJob) {
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
+
+    // Mmap fast path: attack samples (looping or one-shot) play straight
+    // from the file-backed mapping. Sample data lives in the page cache,
+    // not anonymous RSS, so the kernel can reclaim it under pressure.
+    if job.is_attack_sample && job.mmap.is_some() {
+        let mmap = Arc::clone(job.mmap.as_ref().unwrap());
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_mmap_playback(&mut job, &mmap);
+        }));
+        if let Err(e) = panic_result {
+            log::error!("[LoaderThread] mmap path PANICKED for {:?}: {:?}", path_str_clone, e);
+        }
+        job.is_finished.store(true, Ordering::SeqCst);
+        return;
+    }
 
     // Wrap in catch_unwind to prevent a loader panic from crashing the whole engine
     let panic_result = std::panic::catch_unwind(move || {
@@ -243,4 +260,87 @@ pub fn run_loader_job(mut job: SpawnJob) {
     }
 
     job.is_finished.store(true, Ordering::SeqCst);
+}
+
+/// Playback path for attack samples backed by an mmap. Decodes frames
+/// on-the-fly from the mapped bytes — no per-voice `Vec<f32>` allocation.
+/// Handles both looping and one-shot attacks.
+fn run_mmap_playback(job: &mut SpawnJob, mmap: &Arc<MmapSample>) {
+    let total_frames = mmap.total_frames();
+    if total_frames == 0 {
+        return;
+    }
+
+    let (loop_start, loop_end_raw) = mmap.loop_info.unwrap_or((0, 0));
+    let loop_start_frame = loop_start as usize;
+    let loop_end_frame = if loop_end_raw == 0 {
+        total_frames
+    } else {
+        loop_end_raw as usize
+    };
+    let mut is_looping = mmap.loop_info.is_some()
+        && loop_start_frame < loop_end_frame
+        && loop_end_frame <= total_frames;
+
+    let mut current_frame: usize = job.frames_to_skip;
+    if current_frame >= total_frames && !is_looping {
+        return;
+    }
+    if is_looping && current_frame >= loop_end_frame {
+        // Skipped past the loop region; resume at loop_start.
+        current_frame = loop_start_frame;
+    }
+
+    let frames_per_chunk = 1024usize;
+    let mut interleaved = vec![0.0f32; frames_per_chunk * CHANNEL_COUNT];
+
+    'playback: loop {
+        if job.is_cancelled.load(Ordering::Relaxed) {
+            break 'playback;
+        }
+
+        let mut frames_read = 0usize;
+        for i in 0..frames_per_chunk {
+            if is_looping {
+                if current_frame >= loop_end_frame {
+                    current_frame = loop_start_frame;
+                }
+            } else if current_frame >= total_frames {
+                break;
+            }
+
+            let (l, r) = mmap.read_frame_stereo(current_frame);
+            interleaved[i * CHANNEL_COUNT] = l;
+            interleaved[i * CHANNEL_COUNT + 1] = r;
+            current_frame += 1;
+            frames_read += 1;
+        }
+
+        if frames_read > 0 {
+            let to_push = frames_read * CHANNEL_COUNT;
+            let mut offset = 0;
+            while offset < to_push {
+                if job.is_cancelled.load(Ordering::Relaxed) {
+                    break 'playback;
+                }
+                let pushed = job.producer.push_slice(&interleaved[offset..to_push]);
+                offset += pushed;
+                if offset < to_push {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+
+        if !is_looping && current_frame >= total_frames {
+            break 'playback;
+        }
+        if is_looping && frames_read == 0 {
+            // Defensive: shouldn't happen, but avoid hot-spin.
+            thread::sleep(Duration::from_millis(1));
+            // Re-validate the loop region; if it's gone bad, stop looping.
+            if loop_start_frame >= loop_end_frame {
+                is_looping = false;
+            }
+        }
+    }
 }

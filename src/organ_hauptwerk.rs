@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File, canonicalize};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 
 use crate::organ::{ConversionTask, Organ, Pipe, Rank, ReleaseSample, Stop};
 use crate::wav_converter;
@@ -915,7 +915,7 @@ pub fn load_hauptwerk(
                             releases.push(ReleaseSample {
                                 path: extracted_path,
                                 max_key_press_time_ms: release_link.max_key_press_time_ms,
-                                preloaded_bytes: None,
+                                preloaded_bytes: Arc::new(arc_swap::ArcSwapOption::empty()),
                             });
                         }
                     } else {
@@ -931,7 +931,7 @@ pub fn load_hauptwerk(
                                 releases.push(ReleaseSample {
                                     path: final_rel_path,
                                     max_key_press_time_ms: release_link.max_key_press_time_ms,
-                                    preloaded_bytes: None,
+                                    preloaded_bytes: Arc::new(arc_swap::ArcSwapOption::empty()),
                                 });
                             }
                             Err(e) => {
@@ -967,7 +967,7 @@ pub fn load_hauptwerk(
                 releases.push(ReleaseSample {
                     path: extracted_path,
                     max_key_press_time_ms: -1,
-                    preloaded_bytes: None,
+                    preloaded_bytes: Arc::new(arc_swap::ArcSwapOption::empty()),
                 });
             }
         }
@@ -979,7 +979,8 @@ pub fn load_hauptwerk(
                 gain_db: 0.0,
                 pitch_tuning_cents: 0.0,
                 releases,
-                preloaded_bytes: None,
+                preloaded_bytes: Arc::new(arc_swap::ArcSwapOption::empty()),
+                mmap: Arc::new(arc_swap::ArcSwapOption::empty()),
             },
         );
     }

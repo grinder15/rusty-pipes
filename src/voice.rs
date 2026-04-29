@@ -8,6 +8,8 @@ use std::sync::{Arc, mpsc};
 use std::time::Instant;
 
 use crate::organ::Organ;
+use crate::warmup::PinHandle;
+use crate::wav_mmap::MmapSample;
 
 // Common Audio Constants
 pub const CHANNEL_COUNT: usize = 2;
@@ -31,6 +33,10 @@ pub struct SpawnJob {
     pub producer: HeapProd<f32>,
     pub is_finished: Arc<AtomicBool>,
     pub is_cancelled: Arc<AtomicBool>,
+    /// File-backed mmap of the attack sample, shared across voices on the
+    /// same pipe. When present, the loader plays straight from the mapped
+    /// bytes — no per-voice `Vec<f32>` allocation for looping attacks.
+    pub mmap: Option<Arc<MmapSample>>,
 }
 
 /// Represents one playing sample, either attack or release.
@@ -55,6 +61,10 @@ pub struct Voice {
     pub input_buffer: Vec<f32>,
     pub buffer_start_idx: usize,
     pub cursor_pos: f32,
+
+    /// Holds a pin on the sample path in the warm pool for the life of this
+    /// voice. Dropped automatically when the voice is removed.
+    pub _pin: Option<PinHandle>,
 }
 
 impl Voice {
@@ -68,6 +78,7 @@ impl Voice {
         is_attack_sample: bool,
         note_on_time: Instant,
         preloaded_bytes: Option<Arc<Vec<f32>>>,
+        mmap: Option<Arc<MmapSample>>,
         spawner_tx: &mpsc::Sender<SpawnJob>,
         windchest_group_id: Option<String>,
     ) -> Result<Self> {
@@ -102,12 +113,18 @@ impl Voice {
             producer,
             is_finished: Arc::clone(&is_finished),
             is_cancelled: Arc::clone(&is_cancelled),
+            mmap,
         };
 
         if let Err(e) = spawner_tx.send(job) {
             log::error!("Failed to queue voice spawn job: {}", e);
             is_finished.store(true, Ordering::Relaxed);
         }
+
+        let pin = organ
+            .warm_pool
+            .as_ref()
+            .map(|pool| PinHandle::new(Arc::clone(pool), path));
 
         Ok(Self {
             gain,
@@ -126,6 +143,7 @@ impl Voice {
             input_buffer: Vec::with_capacity(4096),
             buffer_start_idx: 0,
             cursor_pos: 0.0,
+            _pin: pin,
         })
     }
 }

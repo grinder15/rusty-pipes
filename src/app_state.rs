@@ -647,6 +647,8 @@ impl AppState {
                 .entry(stop_index)
                 .or_default()
                 .insert(channel);
+            // Hint the audio thread to start preloading this stop's pipes.
+            let _ = audio_tx.send(AppMessage::WarmupStop(stop_index));
             self.dispatch_held_notes_on(stop_index, channel, audio_tx)?;
         } else if !active && was_active {
             if let Some(stop_set) = self.stop_channels.get_mut(&stop_index) {
@@ -771,6 +773,7 @@ impl AppState {
         };
 
         if is_active {
+            let _ = audio_tx.send(AppMessage::WarmupStop(stop_index));
             self.dispatch_held_notes_on(stop_index, channel, audio_tx)?;
         }
 

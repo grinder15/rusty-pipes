@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, canonicalize};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 
 use crate::organ::{
     ConversionTask, Organ, Pipe, Rank, ReleaseSample, Stop, Tremulant, WindchestGroup,
@@ -824,7 +824,7 @@ where
                                 releases.push(ReleaseSample {
                                     path: extracted_path,
                                     max_key_press_time_ms: max_time,
-                                    preloaded_bytes: None,
+                                    preloaded_bytes: Arc::new(arc_swap::ArcSwapOption::empty()),
                                 });
                             }
                         } else {
@@ -847,7 +847,7 @@ where
                                     releases.push(ReleaseSample {
                                         path: final_rel_path,
                                         max_key_press_time_ms: max_time,
-                                        preloaded_bytes: None,
+                                        preloaded_bytes: Arc::new(arc_swap::ArcSwapOption::empty()),
                                     });
                                 }
                                 Err(e) => {
@@ -890,7 +890,7 @@ where
                         releases.push(ReleaseSample {
                             path: extracted_path,
                             max_key_press_time_ms: -1,
-                            preloaded_bytes: None,
+                            preloaded_bytes: Arc::new(arc_swap::ArcSwapOption::empty()),
                         });
                     }
                 }
@@ -902,7 +902,8 @@ where
                         gain_db: 0.0,
                         pitch_tuning_cents: 0.0,
                         releases,
-                        preloaded_bytes: None,
+                        preloaded_bytes: Arc::new(arc_swap::ArcSwapOption::empty()),
+                        mmap: Arc::new(arc_swap::ArcSwapOption::empty()),
                     },
                 );
             }

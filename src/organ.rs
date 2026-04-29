@@ -1,5 +1,7 @@
 use anyhow::{Context, Result, anyhow};
+use arc_swap::ArcSwapOption;
 use bytemuck::{cast_slice, cast_slice_mut};
+use linked_hash_map::LinkedHashMap;
 use rayon::prelude::*;
 use rust_i18n::t;
 use std::collections::{HashMap, HashSet};
@@ -7,7 +9,7 @@ use std::fs;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 
 use crate::wav_converter;
 use crate::wav_converter::SampleMetadata;
@@ -27,6 +29,17 @@ pub struct Organ {
     pub cache_path: PathBuf,          // The directory for cached converted samples
     pub sample_cache: Option<HashMap<PathBuf, Arc<Vec<f32>>>>, // Cache for loaded samples
     pub metadata_cache: Option<HashMap<PathBuf, Arc<SampleMetadata>>>, // Cache for loop points etc.
+
+    /// Per-file frame count used for warmup head loads. Set during `load`.
+    pub frames_per_sample_head: usize,
+    /// Original tuning flag captured at load (used by warmup cache persistence).
+    pub original_tuning: bool,
+    /// 16-bit conversion flag captured at load (used by warmup cache persistence).
+    pub convert_to_16bit: bool,
+    /// Sample rate captured at load (used by warmup cache persistence).
+    pub target_sample_rate: u32,
+    /// Lazy preload pool with LRU eviction. `None` when in pre-cache mode (full load).
+    pub warm_pool: Option<Arc<Mutex<WarmPool>>>,
 }
 
 /// Represents a single stop (a button on the TUI).
@@ -87,7 +100,14 @@ pub struct Pipe {
     pub gain_db: f32,
     pub pitch_tuning_cents: f32,
     pub releases: Vec<ReleaseSample>,
-    pub preloaded_bytes: Option<Arc<Vec<f32>>>,
+    /// Lock-free swappable slot. The warmup worker stores into this; the
+    /// audio thread reads it on note-on. `None` until warmed.
+    pub preloaded_bytes: Arc<ArcSwapOption<Vec<f32>>>,
+    /// File-backed mmap of the attack sample, lazy-initialized on first
+    /// play. Shared across all voices on this pipe. The data lives in the
+    /// kernel page cache (reclaimable under memory pressure) instead of
+    /// per-voice anonymous RSS.
+    pub mmap: Arc<ArcSwapOption<crate::wav_mmap::MmapSample>>,
 }
 
 /// Represents a release sample and its trigger condition.
@@ -96,7 +116,119 @@ pub struct ReleaseSample {
     pub path: PathBuf,
     /// Max key press time in ms. -1 means "default".
     pub max_key_press_time_ms: i64,
-    pub preloaded_bytes: Option<Arc<Vec<f32>>>,
+    pub preloaded_bytes: Arc<ArcSwapOption<Vec<f32>>>,
+}
+
+/// Entry in the warm pool LRU.
+#[derive(Debug)]
+pub struct WarmEntry {
+    pub slot: Arc<ArcSwapOption<Vec<f32>>>,
+    pub bytes: usize,
+}
+
+/// LRU-managed pool that enforces `max_ram_gb` as a hard cap on preloaded
+/// sample heads. Pinned entries (paths whose voices are currently playing)
+/// are skipped during eviction so live audio never goes cold.
+#[derive(Debug)]
+pub struct WarmPool {
+    pub budget_bytes: usize,
+    pub current_bytes: usize,
+    /// Keyed by sample path. Insertion order = LRU front (oldest) to back (newest).
+    pub lru: LinkedHashMap<PathBuf, WarmEntry>,
+    /// Path → live-voice ref count. Non-zero entries are not evictable.
+    pub pinned: HashMap<PathBuf, usize>,
+    /// In-flight load guard; warmup worker uses this to dedupe requests.
+    pub in_flight: HashSet<PathBuf>,
+}
+
+impl WarmPool {
+    pub fn new(budget_bytes: usize) -> Self {
+        Self {
+            budget_bytes,
+            current_bytes: 0,
+            lru: LinkedHashMap::new(),
+            pinned: HashMap::new(),
+            in_flight: HashSet::new(),
+        }
+    }
+
+    /// Bump LRU recency for `path` if present. Called on note-on touch.
+    pub fn touch(&mut self, path: &Path) {
+        if self.lru.contains_key(path) {
+            // Re-inserting moves the entry to the back (most-recently-used).
+            if let Some(entry) = self.lru.remove(path) {
+                self.lru.insert(path.to_path_buf(), entry);
+            }
+        }
+    }
+
+    pub fn pin(&mut self, path: &Path) {
+        *self.pinned.entry(path.to_path_buf()).or_insert(0) += 1;
+    }
+
+    pub fn unpin(&mut self, path: &Path) {
+        if let Some(count) = self.pinned.get_mut(path) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.pinned.remove(path);
+            }
+        }
+    }
+
+    fn is_pinned(&self, path: &Path) -> bool {
+        self.pinned.get(path).copied().unwrap_or(0) > 0
+    }
+
+    /// Try to insert a freshly-loaded head. Evicts unpinned LRU entries to
+    /// make room if needed. Returns false if budget can't be made (caller
+    /// should drop the data).
+    pub fn admit(&mut self, path: PathBuf, slot: Arc<ArcSwapOption<Vec<f32>>>, bytes: usize) -> bool {
+        // Already present: refresh and skip (warmup is idempotent).
+        if self.lru.contains_key(&path) {
+            self.touch(&path);
+            return true;
+        }
+
+        if bytes > self.budget_bytes {
+            return false;
+        }
+
+        while self.current_bytes + bytes > self.budget_bytes {
+            // Find oldest unpinned entry.
+            let victim = self
+                .lru
+                .iter()
+                .find(|(p, _)| !self.is_pinned(p))
+                .map(|(p, _)| p.clone());
+
+            match victim {
+                Some(vp) => {
+                    if let Some(entry) = self.lru.remove(&vp) {
+                        entry.slot.store(None);
+                        self.current_bytes = self.current_bytes.saturating_sub(entry.bytes);
+                    }
+                }
+                None => return false,
+            }
+        }
+
+        self.current_bytes += bytes;
+        self.lru.insert(path, WarmEntry { slot, bytes });
+        true
+    }
+
+    /// Mark a path as in-flight. Returns false if already in-flight or already warm.
+    pub fn try_begin_load(&mut self, path: &Path) -> bool {
+        if self.in_flight.contains(path) || self.lru.contains_key(path) {
+            return false;
+        }
+        self.in_flight.insert(path.to_path_buf());
+        true
+    }
+
+    pub fn end_load(&mut self, path: &Path) {
+        self.in_flight.remove(path);
+    }
 }
 
 /// Internal struct to track unique conversion jobs for parallel processing
@@ -165,14 +297,19 @@ impl Organ {
             // Run the parallel loader
             organ.run_parallel_precache(target_sample_rate, progress_tx)?;
         } else {
-            // Dynamically calculate frame count based on RAM budget
-            organ.preload_attack_samples(
-                target_sample_rate,
-                progress_tx,
-                max_preload_ram_mb,
-                original_tuning,
-                convert_to_16_bit,
-            )?;
+            // Lazy mode: don't read any WAV heads up-front. Compute the per-file
+            // budget so warmup loads use a consistent head size, set up the
+            // warm pool with `max_preload_ram_mb` as the hard cap, and seed
+            // from the on-disk transient cache if it matches current settings.
+            organ.target_sample_rate = target_sample_rate;
+            organ.original_tuning = original_tuning;
+            organ.convert_to_16bit = convert_to_16_bit;
+            organ.frames_per_sample_head = organ.compute_frames_per_sample_head(max_preload_ram_mb);
+
+            let budget_bytes = max_preload_ram_mb.saturating_mul(1024 * 1024);
+            organ.warm_pool = Some(Arc::new(Mutex::new(WarmPool::new(budget_bytes))));
+
+            organ.seed_from_transient_cache(progress_tx)?;
         }
         Ok(organ)
     }
@@ -508,168 +645,137 @@ impl Organ {
         Ok(())
     }
 
-    fn preload_attack_samples(
-        &mut self,
-        target_sample_rate: u32,
-        progress_tx: Option<mpsc::Sender<(f32, String)>>,
-        max_preload_ram_mb: usize,
-        original_tuning: bool,
-        convert_to_16bit: bool,
-    ) -> Result<()> {
-        log::info!(
-            "[Cache] Calculating pre-load budget based on {} MB limit...",
-            max_preload_ram_mb
-        );
-
-        // Collect all paths that need loading
-        let mut paths = HashSet::new();
-        for rank in self.ranks.values() {
-            for pipe in rank.pipes.values() {
-                paths.insert(pipe.attack_sample_path.clone());
-                for r in &pipe.releases {
-                    paths.insert(r.path.clone());
-                }
-            }
-        }
-        let unique_paths: Vec<PathBuf> = paths.into_iter().collect();
-        let total_files = unique_paths.len();
-
+    /// Compute the per-file head size (in frames) for a given RAM budget. Uses
+    /// the same formula the original eager preloader used so that on-disk
+    /// transient caches written under either scheme remain compatible.
+    /// Returns 0 if there are no samples or the budget is too small.
+    fn compute_frames_per_sample_head(&self, max_preload_ram_mb: usize) -> usize {
+        let total_files = self.get_all_unique_sample_paths().len();
         if total_files == 0 {
-            log::debug!("[Cache] No samples found to preload.");
-            return Ok(());
+            return 0;
         }
-
-        // Calculate frames per file based on RAM budget
-        // Total bytes available
-        let total_bytes_budget = max_preload_ram_mb as usize * 1024 * 1024;
-
-        // Bytes available per unique file
+        let total_bytes_budget = max_preload_ram_mb.saturating_mul(1024 * 1024);
         let bytes_per_file = total_bytes_budget / total_files;
+        let bytes_per_frame = std::mem::size_of::<f32>() * 2; // assumed stereo
+        bytes_per_file / bytes_per_frame
+    }
 
-        // Size of one f32 sample
-        let bytes_per_float = std::mem::size_of::<f32>();
-
-        // Heuristic: Assume Stereo (2 channels) to be safe.
-        // If files are mono, we simply load less duration than we could have, but we won't crash RAM.
-        // If files are stereo, we hit the target exactly.
-        let assumed_channels = 2;
-        let bytes_per_frame = bytes_per_float * assumed_channels;
-
-        let frames_to_preload = bytes_per_file / bytes_per_frame;
-
-        // Convert to milliseconds for logging (just for user info)
-        let ms_preload = (frames_to_preload as f32 / target_sample_rate as f32) * 1000.0;
-
-        log::info!(
-            "[Cache] Found {} unique samples. RAM Budget: {} MB.",
-            total_files,
-            max_preload_ram_mb
-        );
-        log::info!(
-            "[Cache] Allocation: ~{} bytes/file -> Preloading {} frames (~{:.1} ms) per sample.",
-            bytes_per_file,
-            frames_to_preload,
-            ms_preload
-        );
-
-        if frames_to_preload == 0 {
-            log::warn!("[Cache] RAM budget is too low to preload any meaningful data per file.");
+    /// Populate `Pipe.preloaded_bytes` from a previously-saved transient cache
+    /// if one exists and matches current settings (sample rate, tuning, etc.).
+    /// Cache miss leaves all pipes empty; the warmup pool will fill them on demand.
+    /// Also pre-admits seeded entries into the warm pool so LRU bookkeeping is correct.
+    fn seed_from_transient_cache(
+        &mut self,
+        progress_tx: Option<mpsc::Sender<(f32, String)>>,
+    ) -> Result<()> {
+        if self.frames_per_sample_head == 0 {
+            log::info!("[Cache] Lazy preload mode: budget too small to seed.");
             return Ok(());
         }
 
-        // Check transient cache first
-        let mut loaded_chunks: Option<HashMap<PathBuf, Arc<Vec<f32>>>> = None;
-        let cache_path_result = self.get_transient_cache_path();
-
-        if let Ok(cache_path) = &cache_path_result {
-            if cache_path.exists() {
-                if let Some(cached_data) = self.load_transient_cache(
-                    cache_path,
-                    frames_to_preload,
-                    original_tuning,
-                    target_sample_rate,
-                    convert_to_16bit,
-                    &progress_tx,
-                ) {
-                    if let Some(tx) = &progress_tx {
-                        let _ = tx.send((1.0, t!("gui.progress_cache_done").to_string()));
-                    }
-                    loaded_chunks = Some(cached_data);
-                }
+        let cache_path = match self.get_transient_cache_path() {
+            Ok(p) if p.exists() => p,
+            _ => {
+                log::info!("[Cache] No transient cache file found; starting cold.");
+                return Ok(());
             }
-        }
-
-        // Cache miss, load wav files
-        let chunks_map = if let Some(map) = loaded_chunks {
-            map
-        } else {
-            // Load them in parallel
-            let loaded_count = AtomicUsize::new(0);
-            let map: HashMap<PathBuf, Arc<Vec<f32>>> = unique_paths
-                .par_iter()
-                .filter_map(|path| {
-                    // Load just the start using a helper from wav_converter
-                    match wav_converter::load_sample_head(
-                        path,
-                        target_sample_rate,
-                        frames_to_preload,
-                    ) {
-                        Ok(data) => {
-                            let current = loaded_count.fetch_add(1, Ordering::Relaxed);
-                            if let Some(tx) = &progress_tx {
-                                if current % 50 == 0 {
-                                    let _ = tx.send((
-                                        current as f32 / total_files as f32,
-                                        t!("gui.progress_load_transients").to_string(),
-                                    ));
-                                }
-                            }
-                            Some((path.clone(), Arc::new(data)))
-                        }
-                        Err(e) => {
-                            log::warn!("Failed to preload {:?}: {}", path, e);
-                            None
-                        }
-                    }
-                })
-                .collect();
-
-            // Save to cache for next time
-            if let Ok(cache_path) = &cache_path_result {
-                if let Err(e) = self.save_transient_cache(
-                    cache_path,
-                    &map,
-                    frames_to_preload,
-                    original_tuning,
-                    target_sample_rate,
-                    convert_to_16bit,
-                    &progress_tx,
-                ) {
-                    log::error!("Failed to save transient cache: {}", e);
-                }
-            }
-
-            map
         };
 
-        // Assign the loaded chunks back to the pipes
+        let chunks = match self.load_transient_cache(
+            &cache_path,
+            self.frames_per_sample_head,
+            self.original_tuning,
+            self.target_sample_rate,
+            self.convert_to_16bit,
+            &progress_tx,
+        ) {
+            Some(m) => m,
+            None => {
+                log::info!("[Cache] Transient cache invalid for current settings; starting cold.");
+                return Ok(());
+            }
+        };
+
+        if let Some(tx) = &progress_tx {
+            let _ = tx.send((1.0, t!("gui.progress_cache_done").to_string()));
+        }
+
+        let pool = self.warm_pool.clone();
+        let mut seeded = 0usize;
         for rank in self.ranks.values_mut() {
             for pipe in rank.pipes.values_mut() {
-                if let Some(data) = chunks_map.get(&pipe.attack_sample_path) {
-                    pipe.preloaded_bytes = Some(data.clone());
+                if let Some(data) = chunks.get(&pipe.attack_sample_path) {
+                    pipe.preloaded_bytes.store(Some(data.clone()));
+                    if let Some(p) = &pool {
+                        let bytes = data.len() * std::mem::size_of::<f32>();
+                        let _ = p.lock().unwrap().admit(
+                            pipe.attack_sample_path.clone(),
+                            pipe.preloaded_bytes.clone(),
+                            bytes,
+                        );
+                    }
+                    seeded += 1;
                 }
                 for release in &mut pipe.releases {
-                    if let Some(data) = chunks_map.get(&release.path) {
-                        release.preloaded_bytes = Some(data.clone());
+                    if let Some(data) = chunks.get(&release.path) {
+                        release.preloaded_bytes.store(Some(data.clone()));
+                        if let Some(p) = &pool {
+                            let bytes = data.len() * std::mem::size_of::<f32>();
+                            let _ = p.lock().unwrap().admit(
+                                release.path.clone(),
+                                release.preloaded_bytes.clone(),
+                                bytes,
+                            );
+                        }
+                        seeded += 1;
                     }
                 }
             }
         }
 
         log::info!(
-            "[Cache] Successfully pre-loaded {} attack headers.",
-            chunks_map.len()
+            "[Cache] Seeded {} sample heads from transient cache.",
+            seeded
         );
+        Ok(())
+    }
+
+    /// Walk all pipes and write currently-warm preload data to the transient cache.
+    /// Called on shutdown so the next session starts warm for whatever was played.
+    pub fn persist_warm_pool(&self) -> Result<()> {
+        if self.frames_per_sample_head == 0 {
+            return Ok(());
+        }
+        let cache_path = self.get_transient_cache_path()?;
+
+        let mut data: HashMap<PathBuf, Arc<Vec<f32>>> = HashMap::new();
+        for rank in self.ranks.values() {
+            for pipe in rank.pipes.values() {
+                if let Some(arc) = pipe.preloaded_bytes.load_full() {
+                    data.insert(pipe.attack_sample_path.clone(), arc);
+                }
+                for release in &pipe.releases {
+                    if let Some(arc) = release.preloaded_bytes.load_full() {
+                        data.insert(release.path.clone(), arc);
+                    }
+                }
+            }
+        }
+
+        if data.is_empty() {
+            log::info!("[Cache] No warm samples to persist.");
+            return Ok(());
+        }
+
+        self.save_transient_cache(
+            &cache_path,
+            &data,
+            self.frames_per_sample_head,
+            self.original_tuning,
+            self.target_sample_rate,
+            self.convert_to_16bit,
+            &None,
+        )?;
         Ok(())
     }
 
@@ -733,5 +839,150 @@ impl Organ {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod warm_pool_tests {
+    use super::*;
+
+    fn slot() -> Arc<ArcSwapOption<Vec<f32>>> {
+        Arc::new(ArcSwapOption::empty())
+    }
+
+    fn p(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    #[test]
+    fn admit_within_budget_succeeds() {
+        let mut pool = WarmPool::new(1000);
+        assert!(pool.admit(p("a"), slot(), 400));
+        assert!(pool.admit(p("b"), slot(), 400));
+        assert_eq!(pool.current_bytes, 800);
+        assert_eq!(pool.lru.len(), 2);
+    }
+
+    #[test]
+    fn admit_rejects_oversized() {
+        let mut pool = WarmPool::new(100);
+        assert!(!pool.admit(p("big"), slot(), 200));
+        assert_eq!(pool.current_bytes, 0);
+        assert!(pool.lru.is_empty());
+    }
+
+    #[test]
+    fn admit_evicts_oldest_unpinned() {
+        let mut pool = WarmPool::new(1000);
+        let s_a = slot();
+        let s_b = slot();
+        s_a.store(Some(Arc::new(vec![1.0; 4])));
+        s_b.store(Some(Arc::new(vec![2.0; 4])));
+        pool.admit(p("a"), s_a.clone(), 600);
+        pool.admit(p("b"), s_b.clone(), 300);
+
+        // Force eviction: 600 + 300 + 500 > 1000 → "a" evicts.
+        assert!(pool.admit(p("c"), slot(), 500));
+        assert!(!pool.lru.contains_key(&p("a")));
+        assert!(pool.lru.contains_key(&p("b")));
+        assert!(pool.lru.contains_key(&p("c")));
+        assert_eq!(pool.current_bytes, 800);
+        // Evicted entry's slot is cleared.
+        assert!(s_a.load_full().is_none());
+        // Surviving entry untouched.
+        assert!(s_b.load_full().is_some());
+    }
+
+    #[test]
+    fn touch_promotes_to_most_recent() {
+        let mut pool = WarmPool::new(1000);
+        pool.admit(p("a"), slot(), 400);
+        pool.admit(p("b"), slot(), 400);
+        // Touching "a" should make "b" the eviction victim now.
+        pool.touch(&p("a"));
+        pool.admit(p("c"), slot(), 400);
+        assert!(pool.lru.contains_key(&p("a")));
+        assert!(!pool.lru.contains_key(&p("b")));
+        assert!(pool.lru.contains_key(&p("c")));
+    }
+
+    #[test]
+    fn touch_missing_path_is_noop() {
+        let mut pool = WarmPool::new(1000);
+        pool.touch(&p("nope"));
+        assert!(pool.lru.is_empty());
+    }
+
+    #[test]
+    fn pinned_entries_not_evicted() {
+        let mut pool = WarmPool::new(1000);
+        pool.admit(p("a"), slot(), 600);
+        pool.admit(p("b"), slot(), 300);
+        pool.pin(&p("a"));
+
+        // "a" is pinned → "b" must be evicted to make room for "c" (400 fits
+        // alongside pinned 600).
+        assert!(pool.admit(p("c"), slot(), 400));
+        assert!(pool.lru.contains_key(&p("a")));
+        assert!(!pool.lru.contains_key(&p("b")));
+        assert!(pool.lru.contains_key(&p("c")));
+    }
+
+    #[test]
+    fn admit_fails_when_only_pinned_entries() {
+        let mut pool = WarmPool::new(1000);
+        pool.admit(p("a"), slot(), 600);
+        pool.admit(p("b"), slot(), 300);
+        pool.pin(&p("a"));
+        pool.pin(&p("b"));
+        // No evictable victims; admit must fail rather than overshoot budget.
+        assert!(!pool.admit(p("c"), slot(), 500));
+        assert_eq!(pool.current_bytes, 900);
+    }
+
+    #[test]
+    fn pin_is_refcounted() {
+        let mut pool = WarmPool::new(100);
+        pool.pin(&p("a"));
+        pool.pin(&p("a"));
+        pool.unpin(&p("a"));
+        assert!(pool.is_pinned(&p("a")));
+        pool.unpin(&p("a"));
+        assert!(!pool.is_pinned(&p("a")));
+    }
+
+    #[test]
+    fn unpin_unknown_path_is_safe() {
+        let mut pool = WarmPool::new(100);
+        pool.unpin(&p("nope"));
+        assert!(!pool.is_pinned(&p("nope")));
+    }
+
+    #[test]
+    fn admit_existing_path_is_idempotent() {
+        let mut pool = WarmPool::new(1000);
+        pool.admit(p("a"), slot(), 400);
+        // Second admit with same path: no double-counting, returns true.
+        assert!(pool.admit(p("a"), slot(), 400));
+        assert_eq!(pool.current_bytes, 400);
+        assert_eq!(pool.lru.len(), 1);
+    }
+
+    #[test]
+    fn try_begin_load_dedupes() {
+        let mut pool = WarmPool::new(100);
+        assert!(pool.try_begin_load(&p("a")));
+        // Second call while in-flight is rejected.
+        assert!(!pool.try_begin_load(&p("a")));
+        pool.end_load(&p("a"));
+        // After end_load, can begin again.
+        assert!(pool.try_begin_load(&p("a")));
+    }
+
+    #[test]
+    fn try_begin_load_skips_already_warm() {
+        let mut pool = WarmPool::new(1000);
+        pool.admit(p("a"), slot(), 100);
+        assert!(!pool.try_begin_load(&p("a")));
     }
 }

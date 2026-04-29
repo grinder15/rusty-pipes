@@ -23,6 +23,7 @@ use crate::audio_event::{enforce_voice_limit, process_message, process_note_on};
 use crate::audio_loader::run_loader_job;
 use crate::audio_recorder::AudioRecorder;
 use crate::voice::{CHANNEL_COUNT, SpawnJob, TREMULANT_AM_BOOST, TremulantLfo, Voice};
+use crate::warmup::{WarmupJob, spawn_warmup_worker};
 
 // Handle struct that manages the lifecycle for the audio thread
 #[allow(dead_code)]
@@ -241,6 +242,10 @@ fn spawn_audio_processing_thread<P>(
 {
     let (ir_loader_tx, ir_loader_rx) = mpsc::channel::<Result<StereoConvolver>>();
     let (spawner_tx, spawner_rx) = mpsc::channel::<SpawnJob>();
+    let warmup_tx: Option<mpsc::Sender<WarmupJob>> = organ
+        .warm_pool
+        .as_ref()
+        .map(|pool| spawn_warmup_worker(Arc::clone(pool), Arc::clone(&stop_signal)));
 
     // Background Thread: Spawner / Loader
     thread::spawn(move || {
@@ -328,6 +333,7 @@ fn spawn_audio_processing_thread<P>(
                         &mut voice_counter,
                         &stop_name_to_index_map,
                         &spawner_tx,
+                        warmup_tx.as_ref(),
                         &mut pending_note_queue,
                         &mut active_tremulants_ids,
                         &mut audio_recorder,
@@ -350,6 +356,7 @@ fn spawn_audio_processing_thread<P>(
                         &stop_name_to_index_map,
                         sample_rate,
                         &spawner_tx,
+                        warmup_tx.as_ref(),
                     );
                     new_voice_count += 1;
                 } else {

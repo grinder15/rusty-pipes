@@ -46,8 +46,10 @@ mod tui_midi_learn;
 mod tui_organ_manager;
 mod tui_progress;
 mod voice;
+mod warmup;
 mod wav;
 mod wav_converter;
+mod wav_mmap;
 
 use app::{AppMessage, TuiMessage};
 use app_state::{AppState, connect_to_midi};
@@ -763,7 +765,7 @@ fn main() -> Result<()> {
                 audio_tx,
                 tui_tx,
                 Arc::clone(&app_state),
-                organ,
+                Arc::clone(&organ),
                 midi_connections, // Pass the Vector of connections
                 gui_ctx_tx,
                 reverb_files,
@@ -775,6 +777,12 @@ fn main() -> Result<()> {
         };
 
         gui_is_running.store(false, Ordering::SeqCst);
+
+        // Persist whatever the warm pool has built up so the next session
+        // starts hot for samples the user actually played.
+        if let Err(e) = organ.persist_warm_pool() {
+            log::warn!("Failed to persist warm pool: {}", e);
+        }
 
         match loop_action {
             app::MainLoopAction::ReloadOrgan { file } => {

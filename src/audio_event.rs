@@ -11,6 +11,34 @@ use crate::audio_recorder::AudioRecorder;
 use crate::midi_recorder::MidiRecorder;
 use crate::organ::Organ;
 use crate::voice::{SpawnJob, VOICE_STEALING_FADE_TIME, Voice};
+use crate::warmup::{self, WarmupJob};
+use crate::wav_mmap::MmapSample;
+use std::path::Path;
+
+/// Lazily mmap an attack sample and store it in the pipe's shared slot.
+/// Called on note-on; the result is shared via `Arc` across all subsequent
+/// voices on the same pipe. Returns `None` if mmap fails (e.g. WavPack or
+/// rate mismatch) — caller falls back to the streaming/decode path.
+fn ensure_pipe_mmap(
+    slot: &Arc<arc_swap::ArcSwapOption<MmapSample>>,
+    path: &Path,
+    target_sample_rate: u32,
+) -> Option<Arc<MmapSample>> {
+    if let Some(existing) = slot.load_full() {
+        return Some(existing);
+    }
+    match MmapSample::open(path, target_sample_rate) {
+        Ok(m) => {
+            let arc = Arc::new(m);
+            slot.store(Some(Arc::clone(&arc)));
+            Some(arc)
+        }
+        Err(e) => {
+            log::debug!("[mmap] Skipping mmap for {:?}: {}", path, e);
+            None
+        }
+    }
+}
 
 /// If voice limit is exceeded, this finds the oldest *release* samples
 /// and forces them to fade out quickly.
@@ -83,7 +111,8 @@ pub fn trigger_note_release(
                     false,
                     false,
                     Instant::now(),
-                    release.preloaded_bytes.clone(),
+                    release.preloaded_bytes.load_full(),
+                    None,
                     spawner_tx,
                     rank.windchest_group_id.clone(),
                 ) {
@@ -150,6 +179,7 @@ pub fn process_note_on(
     stop_map: &HashMap<String, usize>,
     sample_rate: u32,
     spawner_tx: &mpsc::Sender<SpawnJob>,
+    warmup_tx: Option<&mpsc::Sender<WarmupJob>>,
 ) {
     if let AppMessage::NoteOn(note, _vel, stop_name) = msg {
         let note_on_time = Instant::now();
@@ -161,6 +191,18 @@ pub fn process_note_on(
                 if let Some(rank) = organ.ranks.get(rank_id) {
                     if let Some(pipe) = rank.pipes.get(&note) {
                         let total_gain = rank.gain_db + pipe.gain_db;
+
+                        // Bump LRU recency for the touched pipe.
+                        if let Some(pool) = &organ.warm_pool {
+                            warmup::touch(pool, &pipe.attack_sample_path);
+                        }
+
+                        let mmap = ensure_pipe_mmap(
+                            &pipe.mmap,
+                            &pipe.attack_sample_path,
+                            sample_rate,
+                        );
+
                         match Voice::new(
                             &pipe.attack_sample_path,
                             Arc::clone(&organ),
@@ -169,7 +211,8 @@ pub fn process_note_on(
                             false,
                             true,
                             note_on_time,
-                            pipe.preloaded_bytes.clone(),
+                            pipe.preloaded_bytes.load_full(),
+                            mmap,
                             spawner_tx,
                             rank.windchest_group_id.clone(),
                         ) {
@@ -187,11 +230,78 @@ pub fn process_note_on(
                             }
                             Err(e) => log::error!("Error creating attack voice: {}", e),
                         }
+
+                        // Neighbor warmup: enqueue ±3 semitones in this rank
+                        // for any pipes that aren't already preloaded. Drops on
+                        // a full queue are fine — stop-activation warmup catches
+                        // the rest.
+                        if let Some(tx) = warmup_tx {
+                            let frames = organ.frames_per_sample_head;
+                            for offset in [-3i16, -2, -1, 1, 2, 3] {
+                                let nn = note as i16 + offset;
+                                if !(0..=127).contains(&nn) {
+                                    continue;
+                                }
+                                if let Some(neighbor) = rank.pipes.get(&(nn as u8)) {
+                                    if neighbor.preloaded_bytes.load_full().is_none() {
+                                        let _ = tx.send(WarmupJob::PreloadHead {
+                                            path: neighbor.attack_sample_path.clone(),
+                                            slot: neighbor.preloaded_bytes.clone(),
+                                            frames,
+                                            sample_rate,
+                                        });
+                                    }
+                                    if neighbor.mmap.load_full().is_none() {
+                                        let _ = tx.send(WarmupJob::MmapAttack {
+                                            path: neighbor.attack_sample_path.clone(),
+                                            slot: neighbor.mmap.clone(),
+                                            sample_rate,
+                                        });
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
             if !new_notes.is_empty() {
                 active_notes.entry(note).or_default().extend(new_notes);
+            }
+        }
+    }
+}
+
+/// Enqueue warmup jobs for every pipe in every rank drawn by a stop. Called
+/// when the user activates a stop, before they actually press any keys, so
+/// the rank is hot by the time playing starts.
+pub fn enqueue_stop_warmup(
+    stop_index: usize,
+    organ: &Arc<Organ>,
+    warmup_tx: &mpsc::Sender<WarmupJob>,
+    sample_rate: u32,
+) {
+    let frames = organ.frames_per_sample_head;
+    let Some(stop) = organ.stops.get(stop_index) else {
+        return;
+    };
+    for rank_id in &stop.rank_ids {
+        if let Some(rank) = organ.ranks.get(rank_id) {
+            for pipe in rank.pipes.values() {
+                if frames > 0 && pipe.preloaded_bytes.load_full().is_none() {
+                    let _ = warmup_tx.send(WarmupJob::PreloadHead {
+                        path: pipe.attack_sample_path.clone(),
+                        slot: pipe.preloaded_bytes.clone(),
+                        frames,
+                        sample_rate,
+                    });
+                }
+                if pipe.mmap.load_full().is_none() {
+                    let _ = warmup_tx.send(WarmupJob::MmapAttack {
+                        path: pipe.attack_sample_path.clone(),
+                        slot: pipe.mmap.clone(),
+                        sample_rate,
+                    });
+                }
             }
         }
     }
@@ -211,6 +321,7 @@ pub fn process_message(
     voice_counter: &mut u64,
     stop_map: &HashMap<String, usize>,
     spawner_tx: &mpsc::Sender<SpawnJob>,
+    warmup_tx: Option<&mpsc::Sender<WarmupJob>>,
     pending_queue: &mut VecDeque<AppMessage>,
     active_tremulants: &mut HashMap<String, bool>,
     audio_recorder: &mut Option<AudioRecorder>,
@@ -329,6 +440,11 @@ pub fn process_message(
         }
         AppMessage::SetGain(g) => *system_gain = g,
         AppMessage::SetPolyphony(p) => *polyphony = p,
+        AppMessage::WarmupStop(idx) => {
+            if let Some(tx) = warmup_tx {
+                enqueue_stop_warmup(idx, organ, tx, sample_rate);
+            }
+        }
         AppMessage::Quit => {
             // tell the Logic Thread to close the Window.
             // This allows main.rs to finish the loop and handle the respawn.
