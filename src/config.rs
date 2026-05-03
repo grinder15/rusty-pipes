@@ -93,6 +93,10 @@ pub struct AppSettings {
     pub max_ram_gb: f32,
     pub precache: bool,
     pub convert_to_16bit: bool,
+    /// Force in-RAM/sidecar storage of 24-bit PCM as TPDF-dithered i16
+    /// (item #10). Default-on for mobile builds via cfg.
+    #[serde(default = "crate::dither::default_force_16bit_storage")]
+    pub force_16bit_storage: bool,
     pub original_tuning: bool,
     pub tui_mode: bool,
     pub gain: f32,
@@ -208,6 +212,7 @@ impl Default for AppSettings {
             max_ram_gb: 8.0,
             precache: false,
             convert_to_16bit: false,
+            force_16bit_storage: crate::dither::default_force_16bit_storage(),
             original_tuning: false,
             tui_mode: false, // Default to GUI
             gain: 0.4,       // Conservative default gain
@@ -234,6 +239,7 @@ pub struct RuntimeConfig {
     pub max_ram_gb: f32,
     pub precache: bool,
     pub convert_to_16bit: bool,
+    pub force_16bit_storage: bool,
     pub original_tuning: bool,
     pub gain: f32,
     pub polyphony: usize,

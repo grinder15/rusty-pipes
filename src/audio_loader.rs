@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use crate::voice::{CHANNEL_COUNT, SpawnJob};
 use crate::wav::{WavSampleReader, parse_smpl_chunk, parse_wav_metadata};
-use crate::wav_mmap::MmapSample;
+use crate::wav_mmap::{MmapPlayback, MmapSample};
 use std::sync::Arc;
 
 /// Worker function that loads samples from disk or cache and fills the ring buffer.
@@ -271,14 +271,14 @@ fn run_mmap_playback(job: &mut SpawnJob, mmap: &Arc<MmapSample>) {
         return;
     }
 
-    let (loop_start, loop_end_raw) = mmap.loop_info.unwrap_or((0, 0));
+    let (loop_start, loop_end_raw) = mmap.loop_info().unwrap_or((0, 0));
     let loop_start_frame = loop_start as usize;
     let loop_end_frame = if loop_end_raw == 0 {
         total_frames
     } else {
         loop_end_raw as usize
     };
-    let mut is_looping = mmap.loop_info.is_some()
+    let mut is_looping = mmap.loop_info().is_some()
         && loop_start_frame < loop_end_frame
         && loop_end_frame <= total_frames;
 
@@ -293,6 +293,7 @@ fn run_mmap_playback(job: &mut SpawnJob, mmap: &Arc<MmapSample>) {
 
     let frames_per_chunk = 1024usize;
     let mut interleaved = vec![0.0f32; frames_per_chunk * CHANNEL_COUNT];
+    let mut play = MmapPlayback::new(mmap);
 
     'playback: loop {
         if job.is_cancelled.load(Ordering::Relaxed) {
@@ -300,7 +301,7 @@ fn run_mmap_playback(job: &mut SpawnJob, mmap: &Arc<MmapSample>) {
         }
 
         let mut frames_read = 0usize;
-        for i in 0..frames_per_chunk {
+        while frames_read < frames_per_chunk {
             if is_looping {
                 if current_frame >= loop_end_frame {
                     current_frame = loop_start_frame;
@@ -309,11 +310,26 @@ fn run_mmap_playback(job: &mut SpawnJob, mmap: &Arc<MmapSample>) {
                 break;
             }
 
-            let (l, r) = mmap.read_frame_stereo(current_frame);
-            interleaved[i * CHANNEL_COUNT] = l;
-            interleaved[i * CHANNEL_COUNT + 1] = r;
-            current_frame += 1;
-            frames_read += 1;
+            // Don't read past loop_end in a single playback step — the
+            // outer wrap is what re-seeks the cursor to loop_start.
+            let frames_left_in_chunk = frames_per_chunk - frames_read;
+            let frames_until_boundary = if is_looping {
+                loop_end_frame.saturating_sub(current_frame)
+            } else {
+                total_frames.saturating_sub(current_frame)
+            };
+            let want = frames_left_in_chunk.min(frames_until_boundary);
+            if want == 0 {
+                break;
+            }
+            let dest_start = frames_read * CHANNEL_COUNT;
+            let dest_end = dest_start + want * CHANNEL_COUNT;
+            let n = play.read(current_frame, &mut interleaved[dest_start..dest_end]);
+            if n == 0 {
+                break;
+            }
+            current_frame += n;
+            frames_read += n;
         }
 
         if frames_read > 0 {

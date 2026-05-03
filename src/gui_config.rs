@@ -562,6 +562,15 @@ impl App for ConfigApp {
                                 )
                                 .on_hover_text(t!("config.tooltip_convert"));
                                 ui.checkbox(
+                                    &mut self.state.settings.force_16bit_storage,
+                                    "Force 16-bit storage (24-bit → dithered i16)",
+                                )
+                                .on_hover_text(
+                                    "Stores 24-bit samples in RAM/sidecars as TPDF-dithered i16. \
+                                     Differs from 'Convert to 16-bit' (which rewrites the source WAVs); \
+                                     this affects in-memory and on-disk sidecar layout only.",
+                                );
+                                ui.checkbox(
                                     &mut self.state.settings.original_tuning,
                                     t!("config.chk_tuning"),
                                 )
@@ -639,6 +648,7 @@ impl App for ConfigApp {
                                 max_ram_gb: self.state.settings.max_ram_gb,
                                 precache: self.state.settings.precache,
                                 convert_to_16bit: self.state.settings.convert_to_16bit,
+                                force_16bit_storage: self.state.settings.force_16bit_storage,
                                 original_tuning: self.state.settings.original_tuning,
                                 midi_file: self.state.midi_file.clone(),
                                 active_midi_devices: active_devices,

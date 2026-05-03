@@ -370,6 +370,7 @@ pub fn run_config_ui(
                                                 max_ram_gb: s.max_ram_gb,
                                                 precache: s.precache,
                                                 convert_to_16bit: s.convert_to_16bit,
+                                                force_16bit_storage: s.force_16bit_storage,
                                                 original_tuning: s.original_tuning,
                                                 midi_file: state.config_state.midi_file.clone(),
                                                 active_midi_devices: active_devices,

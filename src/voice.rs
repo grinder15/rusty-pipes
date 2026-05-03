@@ -1,13 +1,16 @@
 use anyhow::Result;
 use decibel::{AmplitudeRatio, DecibelRatio};
-use ringbuf::traits::{Producer, Split};
+use ringbuf::traits::Split;
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
+use std::thread;
 use std::time::Instant;
 
+use crate::audio_loader::run_loader_job;
 use crate::organ::Organ;
+use crate::preload::PreloadHead;
 use crate::warmup::PinHandle;
 use crate::wav_mmap::MmapSample;
 
@@ -77,7 +80,7 @@ impl Voice {
         start_fading_in: bool,
         is_attack_sample: bool,
         note_on_time: Instant,
-        preloaded_bytes: Option<Arc<Vec<f32>>>,
+        preloaded_bytes: Option<Arc<PreloadHead>>,
         mmap: Option<Arc<MmapSample>>,
         spawner_tx: &mpsc::Sender<SpawnJob>,
         windchest_group_id: Option<String>,
@@ -100,7 +103,7 @@ impl Voice {
 
         let mut preloaded_frames_count = 0;
         if let Some(ref preloaded) = preloaded_bytes {
-            let pushed = producer.push_slice(preloaded);
+            let pushed = preloaded.push_into(&mut producer);
             preloaded_frames_count = pushed / CHANNEL_COUNT;
         }
 
@@ -116,9 +119,20 @@ impl Voice {
             mmap,
         };
 
-        if let Err(e) = spawner_tx.send(job) {
-            log::error!("Failed to queue voice spawn job: {}", e);
-            is_finished.store(true, Ordering::Relaxed);
+        // Releases are latency-critical: the audio thread blocks the crossfade
+        // until the release voice has buffered data. Routing them through the
+        // shared loader pool means they queue behind any in-flight attack
+        // loads, which under staccato bursts produces audibly delayed reverb
+        // tails. Spawn release loads on a fresh thread so they start
+        // immediately. Attacks still go through the pool — that's where the
+        // OS-thread-storm problem (Fix B) actually lives.
+        if is_attack_sample {
+            if let Err(e) = spawner_tx.send(job) {
+                log::error!("Failed to queue voice spawn job: {}", e);
+                is_finished.store(true, Ordering::Relaxed);
+            }
+        } else {
+            thread::spawn(move || run_loader_job(job));
         }
 
         let pin = organ

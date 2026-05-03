@@ -23,6 +23,7 @@ mod audio_event;
 mod audio_loader;
 mod audio_recorder;
 mod config;
+mod dither;
 mod gui;
 mod gui_config;
 mod gui_filepicker;
@@ -37,6 +38,9 @@ mod midi_recorder;
 mod organ;
 mod organ_grandorgue;
 mod organ_hauptwerk;
+mod preload;
+mod sample_codec;
+mod sample_sidecar;
 mod tui;
 mod tui_config;
 mod tui_filepicker;
@@ -87,6 +91,11 @@ struct Args {
     /// Convert all samples to 16-bit PCM on load (saves memory, may reduce quality)
     #[arg(long)]
     convert_to_16bit: Option<bool>,
+
+    /// Force in-RAM/sidecar storage of 24-bit samples as TPDF-dithered 16-bit
+    /// (saves ~1.33× RAM; default-on for mobile builds)
+    #[arg(long)]
+    force_16bit_storage: Option<bool>,
 
     /// Set the application log level
     #[arg(long, value_name = "LEVEL", default_value = "info")]
@@ -257,6 +266,9 @@ fn main() -> Result<()> {
     if let Some(c) = args.convert_to_16bit {
         settings.convert_to_16bit = c;
     }
+    if let Some(c) = args.force_16bit_storage {
+        settings.force_16bit_storage = c;
+    }
     if let Some(o) = args.original_tuning {
         settings.original_tuning = o;
     }
@@ -318,6 +330,7 @@ fn main() -> Result<()> {
             max_ram_gb: settings.max_ram_gb,
             precache: settings.precache,
             convert_to_16bit: settings.convert_to_16bit,
+            force_16bit_storage: settings.force_16bit_storage,
             original_tuning: settings.original_tuning,
             active_midi_devices,
             gain: settings.gain,
@@ -373,6 +386,7 @@ fn main() -> Result<()> {
         max_ram_gb: config.max_ram_gb,
         precache: config.precache,
         convert_to_16bit: config.convert_to_16bit,
+        force_16bit_storage: config.force_16bit_storage,
         original_tuning: config.original_tuning,
         midi_devices: devices_to_save,
         gain: config.gain,
@@ -387,6 +401,11 @@ fn main() -> Result<()> {
     if let Err(e) = config::save_settings(&settings_to_save) {
         log::warn!("Failed to save settings: {}", e);
     }
+
+    // Propagate the storage toggle to the global atomic so the load paths
+    // in `wav_converter`, `wav_mmap`, and `sample_sidecar` consult it
+    // without threading config through every call site.
+    dither::set_force_16bit_storage(config.force_16bit_storage);
 
     // --- APPLICATION MAIN LOOP ---
     loop {

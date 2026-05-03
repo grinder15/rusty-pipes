@@ -23,7 +23,7 @@ use crate::audio_event::{enforce_voice_limit, process_message, process_note_on};
 use crate::audio_loader::run_loader_job;
 use crate::audio_recorder::AudioRecorder;
 use crate::voice::{CHANNEL_COUNT, SpawnJob, TREMULANT_AM_BOOST, TremulantLfo, Voice};
-use crate::warmup::{WarmupJob, spawn_warmup_worker};
+use crate::warmup::{WarmupSender, spawn_warmup_worker};
 
 // Handle struct that manages the lifecycle for the audio thread
 #[allow(dead_code)]
@@ -242,16 +242,24 @@ fn spawn_audio_processing_thread<P>(
 {
     let (ir_loader_tx, ir_loader_rx) = mpsc::channel::<Result<StereoConvolver>>();
     let (spawner_tx, spawner_rx) = mpsc::channel::<SpawnJob>();
-    let warmup_tx: Option<mpsc::Sender<WarmupJob>> = organ
+    let warmup_tx: Option<WarmupSender> = organ
         .warm_pool
         .as_ref()
         .map(|pool| spawn_warmup_worker(Arc::clone(pool), Arc::clone(&stop_signal)));
 
-    // Background Thread: Spawner / Loader
+    // Background Thread: Spawner / Loader.
+    //
+    // Each `run_loader_job` call runs the *entire* per-voice playback loop
+    // (often many seconds for a sustained organ note), not just a quick
+    // load. Pooling these would mean a few workers monopolised by long-
+    // lived voices and every additional note queued behind them — which
+    // shows up as "I press a chord but only one pipe sounds." So we keep
+    // the per-voice detached-thread pattern. It costs one OS thread per
+    // live voice, which the scheduler handles fine at typical organ
+    // polyphony.
     thread::spawn(move || {
         log::info!("[SpawnerThread] Started.");
         for job in spawner_rx {
-            // Detached thread for each voice load to allow concurrency
             thread::spawn(move || {
                 run_loader_job(job);
             });

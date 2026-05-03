@@ -1,7 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use arc_swap::ArcSwapOption;
 use bytemuck::{cast_slice, cast_slice_mut};
-use linked_hash_map::LinkedHashMap;
 use rayon::prelude::*;
 use rust_i18n::t;
 use std::collections::{HashMap, HashSet};
@@ -11,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
+use crate::preload::{PreloadHead, WarmSlot};
 use crate::wav_converter;
 use crate::wav_converter::SampleMetadata;
 
@@ -102,7 +102,7 @@ pub struct Pipe {
     pub releases: Vec<ReleaseSample>,
     /// Lock-free swappable slot. The warmup worker stores into this; the
     /// audio thread reads it on note-on. `None` until warmed.
-    pub preloaded_bytes: Arc<ArcSwapOption<Vec<f32>>>,
+    pub preloaded_bytes: Arc<ArcSwapOption<PreloadHead>>,
     /// File-backed mmap of the attack sample, lazy-initialized on first
     /// play. Shared across all voices on this pipe. The data lives in the
     /// kernel page cache (reclaimable under memory pressure) instead of
@@ -116,29 +116,54 @@ pub struct ReleaseSample {
     pub path: PathBuf,
     /// Max key press time in ms. -1 means "default".
     pub max_key_press_time_ms: i64,
-    pub preloaded_bytes: Arc<ArcSwapOption<Vec<f32>>>,
+    pub preloaded_bytes: Arc<ArcSwapOption<PreloadHead>>,
 }
 
 /// Entry in the warm pool LRU.
 #[derive(Debug)]
 pub struct WarmEntry {
-    pub slot: Arc<ArcSwapOption<Vec<f32>>>,
+    /// Type-erased slot — calling `clear()` evicts whatever variant is in
+    /// it (preload head, mmap, etc.). The pool only needs the byte size
+    /// for budgeting and the eviction action.
+    pub slot: Arc<dyn WarmSlot>,
     pub bytes: usize,
+    /// Monotonic recency token. Larger = more recent. Compared across the
+    /// preload and mmap LRUs to find the globally oldest victim.
+    seq: u64,
 }
 
-/// LRU-managed pool that enforces `max_ram_gb` as a hard cap on preloaded
-/// sample heads. Pinned entries (paths whose voices are currently playing)
-/// are skipped during eviction so live audio never goes cold.
+/// Which sub-LRU an entry lives in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WarmKind {
+    Preload,
+    Mmap,
+}
+
+/// LRU-managed pool that enforces `max_ram_gb` as a hard cap on
+/// sample-related RAM. Tracks two kinds of entries under one byte budget:
+///
+/// - **Preload heads** (`preload_lru`): the first ~N frames of an attack
+///   sample held in anonymous RAM, used to start a voice without disk I/O.
+/// - **Mmap attack samples** (`mmap_lru`): file-backed mappings of the
+///   attack WAV, used by sustained playback. Bytes are page-cache resident
+///   but still count against the budget so a phone-class device gets a
+///   true ceiling.
+///
+/// Both maps share `pinned` (paths whose voices are currently playing are
+/// not evictable) so a single `PinHandle` keyed on the attack-sample path
+/// protects both the preload head and the mmap entry for that pipe.
 #[derive(Debug)]
 pub struct WarmPool {
     pub budget_bytes: usize,
     pub current_bytes: usize,
-    /// Keyed by sample path. Insertion order = LRU front (oldest) to back (newest).
-    pub lru: LinkedHashMap<PathBuf, WarmEntry>,
+    pub preload_lru: HashMap<PathBuf, WarmEntry>,
+    pub mmap_lru: HashMap<PathBuf, WarmEntry>,
     /// Path → live-voice ref count. Non-zero entries are not evictable.
     pub pinned: HashMap<PathBuf, usize>,
-    /// In-flight load guard; warmup worker uses this to dedupe requests.
+    /// In-flight load guard; warmup worker uses this to dedupe preload-head
+    /// loads (mmap loads are fast and idempotent, so they don't need it).
     pub in_flight: HashSet<PathBuf>,
+    next_seq: u64,
 }
 
 impl WarmPool {
@@ -146,19 +171,29 @@ impl WarmPool {
         Self {
             budget_bytes,
             current_bytes: 0,
-            lru: LinkedHashMap::new(),
+            preload_lru: HashMap::new(),
+            mmap_lru: HashMap::new(),
             pinned: HashMap::new(),
             in_flight: HashSet::new(),
+            next_seq: 0,
         }
     }
 
-    /// Bump LRU recency for `path` if present. Called on note-on touch.
+    fn bump_seq(&mut self) -> u64 {
+        let s = self.next_seq;
+        self.next_seq += 1;
+        s
+    }
+
+    /// Bump LRU recency for `path` in whichever sub-LRU(s) hold it.
+    /// Called on note-on touch. Cheap; safe to call on the audio thread.
     pub fn touch(&mut self, path: &Path) {
-        if self.lru.contains_key(path) {
-            // Re-inserting moves the entry to the back (most-recently-used).
-            if let Some(entry) = self.lru.remove(path) {
-                self.lru.insert(path.to_path_buf(), entry);
-            }
+        let s = self.bump_seq();
+        if let Some(e) = self.preload_lru.get_mut(path) {
+            e.seq = s;
+        }
+        if let Some(e) = self.mmap_lru.get_mut(path) {
+            e.seq = s;
         }
     }
 
@@ -175,17 +210,55 @@ impl WarmPool {
         }
     }
 
-    fn is_pinned(&self, path: &Path) -> bool {
+    pub fn is_pinned(&self, path: &Path) -> bool {
         self.pinned.get(path).copied().unwrap_or(0) > 0
     }
 
-    /// Try to insert a freshly-loaded head. Evicts unpinned LRU entries to
-    /// make room if needed. Returns false if budget can't be made (caller
-    /// should drop the data).
-    pub fn admit(&mut self, path: PathBuf, slot: Arc<ArcSwapOption<Vec<f32>>>, bytes: usize) -> bool {
-        // Already present: refresh and skip (warmup is idempotent).
-        if self.lru.contains_key(&path) {
-            self.touch(&path);
+    /// Admit a preload head into the pool. Evicts globally oldest unpinned
+    /// entries (across both LRUs) to make room. Returns false if no
+    /// admissible budget is available (caller should drop the data).
+    pub fn admit_preload(
+        &mut self,
+        path: PathBuf,
+        slot: Arc<dyn WarmSlot>,
+        bytes: usize,
+    ) -> bool {
+        self.admit(WarmKind::Preload, path, slot, bytes)
+    }
+
+    /// Admit an mmap attack sample into the pool. Same eviction rules as
+    /// `admit_preload`; entry lives in the mmap LRU.
+    pub fn admit_mmap(
+        &mut self,
+        path: PathBuf,
+        slot: Arc<dyn WarmSlot>,
+        bytes: usize,
+    ) -> bool {
+        self.admit(WarmKind::Mmap, path, slot, bytes)
+    }
+
+    fn admit(
+        &mut self,
+        kind: WarmKind,
+        path: PathBuf,
+        slot: Arc<dyn WarmSlot>,
+        bytes: usize,
+    ) -> bool {
+        // Already present in the target LRU: refresh recency and skip
+        // (admission is idempotent within a kind).
+        let existing = match kind {
+            WarmKind::Preload => self.preload_lru.contains_key(&path),
+            WarmKind::Mmap => self.mmap_lru.contains_key(&path),
+        };
+        if existing {
+            let s = self.bump_seq();
+            let entry = match kind {
+                WarmKind::Preload => self.preload_lru.get_mut(&path),
+                WarmKind::Mmap => self.mmap_lru.get_mut(&path),
+            };
+            if let Some(e) = entry {
+                e.seq = s;
+            }
             return true;
         }
 
@@ -194,32 +267,68 @@ impl WarmPool {
         }
 
         while self.current_bytes + bytes > self.budget_bytes {
-            // Find oldest unpinned entry.
-            let victim = self
-                .lru
-                .iter()
-                .find(|(p, _)| !self.is_pinned(p))
-                .map(|(p, _)| p.clone());
-
-            match victim {
-                Some(vp) => {
-                    if let Some(entry) = self.lru.remove(&vp) {
-                        entry.slot.store(None);
-                        self.current_bytes = self.current_bytes.saturating_sub(entry.bytes);
-                    }
-                }
-                None => return false,
+            if !self.evict_oldest_unpinned() {
+                return false;
             }
         }
 
+        let seq = self.bump_seq();
+        let entry = WarmEntry { slot, bytes, seq };
+        match kind {
+            WarmKind::Preload => {
+                self.preload_lru.insert(path, entry);
+            }
+            WarmKind::Mmap => {
+                self.mmap_lru.insert(path, entry);
+            }
+        }
         self.current_bytes += bytes;
-        self.lru.insert(path, WarmEntry { slot, bytes });
         true
     }
 
-    /// Mark a path as in-flight. Returns false if already in-flight or already warm.
+    /// Find and remove the globally oldest unpinned entry across both
+    /// LRUs, clearing its slot. Returns false if every entry is pinned.
+    fn evict_oldest_unpinned(&mut self) -> bool {
+        let mut victim: Option<(WarmKind, PathBuf, u64)> = None;
+        for (p, e) in &self.preload_lru {
+            if self.is_pinned(p) {
+                continue;
+            }
+            if victim.as_ref().map_or(true, |v| e.seq < v.2) {
+                victim = Some((WarmKind::Preload, p.clone(), e.seq));
+            }
+        }
+        for (p, e) in &self.mmap_lru {
+            if self.is_pinned(p) {
+                continue;
+            }
+            if victim.as_ref().map_or(true, |v| e.seq < v.2) {
+                victim = Some((WarmKind::Mmap, p.clone(), e.seq));
+            }
+        }
+        match victim {
+            Some((WarmKind::Preload, p, _)) => {
+                if let Some(e) = self.preload_lru.remove(&p) {
+                    e.slot.clear();
+                    self.current_bytes = self.current_bytes.saturating_sub(e.bytes);
+                }
+                true
+            }
+            Some((WarmKind::Mmap, p, _)) => {
+                if let Some(e) = self.mmap_lru.remove(&p) {
+                    e.slot.clear();
+                    self.current_bytes = self.current_bytes.saturating_sub(e.bytes);
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Mark a path as in-flight for preload-head loading. Returns false if
+    /// already in-flight or already warm.
     pub fn try_begin_load(&mut self, path: &Path) -> bool {
-        if self.in_flight.contains(path) || self.lru.contains_key(path) {
+        if self.in_flight.contains(path) || self.preload_lru.contains_key(path) {
             return false;
         }
         self.in_flight.insert(path.to_path_buf());
@@ -451,14 +560,16 @@ impl Organ {
         expected_sample_rate: u32,
         expected_16bit: bool,
         progress_tx: &Option<mpsc::Sender<(f32, String)>>,
-    ) -> Option<HashMap<PathBuf, Arc<Vec<f32>>>> {
+    ) -> Option<HashMap<PathBuf, Arc<PreloadHead>>> {
         let file = fs::File::open(path).ok()?;
         let mut reader = BufReader::with_capacity(1_024 * 1_024, file);
 
-        // Validate Magic Header
+        // Validate Magic Header. `TRN3` adds the Compressed (codec) variant
+        // alongside i16/f32; older `TRN2`/`TRNS` caches are no longer
+        // compatible.
         let mut magic = [0u8; 4];
-        if reader.read_exact(&mut magic).is_err() || &magic != b"TRNS" {
-            log::warn!("[Cache] Cache file corrupted or invalid format.");
+        if reader.read_exact(&mut magic).is_err() || &magic != b"TRN3" {
+            log::warn!("[Cache] Cache file missing or wrong format; rebuilding.");
             return None;
         }
 
@@ -546,25 +657,69 @@ impl Organ {
             let path_str = String::from_utf8_lossy(&path_buffer).to_string();
             let path = PathBuf::from(path_str);
 
-            // Read Data Length (number of f32s)
+            // Read Variant Tag: 0 = I16, 1 = F32
+            let mut tag_buf = [0u8; 1];
+            if reader.read_exact(&mut tag_buf).is_err() {
+                break;
+            }
+
+            // Read Data Length (number of samples — i16 or f32 depending on tag)
             if reader.read_exact(&mut len_buf).is_err() {
                 break;
             }
             let data_len = u64::from_le_bytes(len_buf) as usize;
 
-            // Allocate the memory as f32s (ensures correct alignment)
-            let mut samples = vec![0.0f32; data_len];
+            let head = match tag_buf[0] {
+                0 => {
+                    let mut samples = vec![0i16; data_len];
+                    let byte_slice: &mut [u8] = cast_slice_mut(&mut samples);
+                    if reader.read_exact(byte_slice).is_err() {
+                        break;
+                    }
+                    PreloadHead::I16(Arc::new(samples))
+                }
+                1 => {
+                    let mut samples = vec![0.0f32; data_len];
+                    let byte_slice: &mut [u8] = cast_slice_mut(&mut samples);
+                    if reader.read_exact(byte_slice).is_err() {
+                        break;
+                    }
+                    PreloadHead::F32(Arc::new(samples))
+                }
+                2 => {
+                    // Compressed: data_len reused as frame_count; encoded
+                    // length follows as a separate u64.
+                    let frame_count = data_len;
+                    let mut enc_len_buf = [0u8; 8];
+                    if reader.read_exact(&mut enc_len_buf).is_err() {
+                        break;
+                    }
+                    let enc_len = u64::from_le_bytes(enc_len_buf) as usize;
+                    let mut encoded = vec![0u8; enc_len];
+                    if reader.read_exact(&mut encoded).is_err() {
+                        break;
+                    }
+                    PreloadHead::Compressed(Arc::new(crate::sample_codec::CompressedPayload {
+                        encoded,
+                        frame_count,
+                        decoded: std::sync::OnceLock::new(),
+                    }))
+                }
+                _ => {
+                    log::warn!("[Cache] Unknown chunk variant tag {}; rebuilding.", tag_buf[0]);
+                    return None;
+                }
+            };
 
-            // Safely cast the f32 slice to a mutable u8 slice
-            // bytemuck checks that f32 is "Pod" (Plain Old Data) and safe to write bytes into.
-            let byte_slice: &mut [u8] = cast_slice_mut(&mut samples);
+            // Eagerly decode `Compressed` heads here, off the audio thread.
+            // Without this, the first note-on per pipe pays for the
+            // predictor + LEB128 decode inside `Voice::new` on the audio
+            // thread (see `PreloadHead::push_into` cold-fallback arm),
+            // which manifests as late onset / "staccato" attacks after a
+            // boot from a populated transient cache.
+            head.ensure_decoded();
 
-            // Read directly from file into the vector's memory
-            if reader.read_exact(byte_slice).is_err() {
-                break;
-            }
-
-            map.insert(path, Arc::new(samples));
+            map.insert(path, Arc::new(head));
 
             if let Some(tx) = progress_tx {
                 if i % 1000 == 0 || i == total_count - 1 {
@@ -586,7 +741,7 @@ impl Organ {
     fn save_transient_cache(
         &self,
         path: &Path,
-        data: &HashMap<PathBuf, Arc<Vec<f32>>>,
+        data: &HashMap<PathBuf, Arc<PreloadHead>>,
         frames_per_sample: usize,
         original_tuning: bool,
         sample_rate: u32,
@@ -596,8 +751,9 @@ impl Organ {
         let file = fs::File::create(path)?;
         let mut writer = BufWriter::with_capacity(1_024 * 1_024, file);
 
-        // Write Magic Header
-        writer.write_all(b"TRNS")?;
+        // Write Magic Header (v3: per-chunk variant tag, includes
+        // Compressed codec variant).
+        writer.write_all(b"TRN3")?;
         // Write Frames Per Sample
         writer.write_all(&(frames_per_sample as u64).to_le_bytes())?;
 
@@ -615,17 +771,34 @@ impl Organ {
         writer.write_all(&(total_count as u64).to_le_bytes())?;
 
         let mut i = 0;
-        for (path_buf, samples) in data {
+        for (path_buf, head) in data {
             let path_str = path_buf.to_string_lossy();
             let path_bytes = path_str.as_bytes();
             writer.write_all(&(path_bytes.len() as u64).to_le_bytes())?;
             writer.write_all(path_bytes)?;
 
-            writer.write_all(&(samples.len() as u64).to_le_bytes())?;
-
-            // Safely cast the f32 slice to a u8 slice for writing
-            let byte_slice: &[u8] = cast_slice(samples);
-            writer.write_all(byte_slice)?;
+            match head.as_ref() {
+                PreloadHead::I16(v) => {
+                    writer.write_all(&[0u8])?;
+                    writer.write_all(&(v.len() as u64).to_le_bytes())?;
+                    let byte_slice: &[u8] = cast_slice(v.as_slice());
+                    writer.write_all(byte_slice)?;
+                }
+                PreloadHead::F32(v) => {
+                    writer.write_all(&[1u8])?;
+                    writer.write_all(&(v.len() as u64).to_le_bytes())?;
+                    let byte_slice: &[u8] = cast_slice(v.as_slice());
+                    writer.write_all(byte_slice)?;
+                }
+                PreloadHead::Compressed(p) => {
+                    writer.write_all(&[2u8])?;
+                    // Reuse data_len slot for frame_count, then a separate
+                    // encoded-length u64 followed by the encoded bytes.
+                    writer.write_all(&(p.frame_count as u64).to_le_bytes())?;
+                    writer.write_all(&(p.encoded.len() as u64).to_le_bytes())?;
+                    writer.write_all(&p.encoded)?;
+                }
+            }
 
             if let Some(tx) = progress_tx {
                 i += 1;
@@ -705,10 +878,10 @@ impl Organ {
         for rank in self.ranks.values_mut() {
             for pipe in rank.pipes.values_mut() {
                 if let Some(data) = chunks.get(&pipe.attack_sample_path) {
+                    let bytes = data.byte_size();
                     pipe.preloaded_bytes.store(Some(data.clone()));
                     if let Some(p) = &pool {
-                        let bytes = data.len() * std::mem::size_of::<f32>();
-                        let _ = p.lock().unwrap().admit(
+                        let _ = p.lock().unwrap().admit_preload(
                             pipe.attack_sample_path.clone(),
                             pipe.preloaded_bytes.clone(),
                             bytes,
@@ -718,10 +891,10 @@ impl Organ {
                 }
                 for release in &mut pipe.releases {
                     if let Some(data) = chunks.get(&release.path) {
+                        let bytes = data.byte_size();
                         release.preloaded_bytes.store(Some(data.clone()));
                         if let Some(p) = &pool {
-                            let bytes = data.len() * std::mem::size_of::<f32>();
-                            let _ = p.lock().unwrap().admit(
+                            let _ = p.lock().unwrap().admit_preload(
                                 release.path.clone(),
                                 release.preloaded_bytes.clone(),
                                 bytes,
@@ -748,7 +921,7 @@ impl Organ {
         }
         let cache_path = self.get_transient_cache_path()?;
 
-        let mut data: HashMap<PathBuf, Arc<Vec<f32>>> = HashMap::new();
+        let mut data: HashMap<PathBuf, Arc<PreloadHead>> = HashMap::new();
         for rank in self.ranks.values() {
             for pipe in rank.pipes.values() {
                 if let Some(arc) = pipe.preloaded_bytes.load_full() {
@@ -846,8 +1019,12 @@ impl Organ {
 mod warm_pool_tests {
     use super::*;
 
-    fn slot() -> Arc<ArcSwapOption<Vec<f32>>> {
-        Arc::new(ArcSwapOption::empty())
+    fn typed_slot() -> Arc<ArcSwapOption<PreloadHead>> {
+        Arc::new(ArcSwapOption::<PreloadHead>::empty())
+    }
+
+    fn slot() -> Arc<dyn WarmSlot> {
+        typed_slot()
     }
 
     fn p(s: &str) -> PathBuf {
@@ -857,35 +1034,35 @@ mod warm_pool_tests {
     #[test]
     fn admit_within_budget_succeeds() {
         let mut pool = WarmPool::new(1000);
-        assert!(pool.admit(p("a"), slot(), 400));
-        assert!(pool.admit(p("b"), slot(), 400));
+        assert!(pool.admit_preload(p("a"), slot(), 400));
+        assert!(pool.admit_preload(p("b"), slot(), 400));
         assert_eq!(pool.current_bytes, 800);
-        assert_eq!(pool.lru.len(), 2);
+        assert_eq!(pool.preload_lru.len(), 2);
     }
 
     #[test]
     fn admit_rejects_oversized() {
         let mut pool = WarmPool::new(100);
-        assert!(!pool.admit(p("big"), slot(), 200));
+        assert!(!pool.admit_preload(p("big"), slot(), 200));
         assert_eq!(pool.current_bytes, 0);
-        assert!(pool.lru.is_empty());
+        assert!(pool.preload_lru.is_empty());
     }
 
     #[test]
     fn admit_evicts_oldest_unpinned() {
         let mut pool = WarmPool::new(1000);
-        let s_a = slot();
-        let s_b = slot();
-        s_a.store(Some(Arc::new(vec![1.0; 4])));
-        s_b.store(Some(Arc::new(vec![2.0; 4])));
-        pool.admit(p("a"), s_a.clone(), 600);
-        pool.admit(p("b"), s_b.clone(), 300);
+        let s_a = typed_slot();
+        let s_b = typed_slot();
+        s_a.store(Some(Arc::new(PreloadHead::F32(Arc::new(vec![1.0; 4])))));
+        s_b.store(Some(Arc::new(PreloadHead::F32(Arc::new(vec![2.0; 4])))));
+        pool.admit_preload(p("a"), s_a.clone(), 600);
+        pool.admit_preload(p("b"), s_b.clone(), 300);
 
         // Force eviction: 600 + 300 + 500 > 1000 → "a" evicts.
-        assert!(pool.admit(p("c"), slot(), 500));
-        assert!(!pool.lru.contains_key(&p("a")));
-        assert!(pool.lru.contains_key(&p("b")));
-        assert!(pool.lru.contains_key(&p("c")));
+        assert!(pool.admit_preload(p("c"), slot(), 500));
+        assert!(!pool.preload_lru.contains_key(&p("a")));
+        assert!(pool.preload_lru.contains_key(&p("b")));
+        assert!(pool.preload_lru.contains_key(&p("c")));
         assert_eq!(pool.current_bytes, 800);
         // Evicted entry's slot is cleared.
         assert!(s_a.load_full().is_none());
@@ -896,47 +1073,48 @@ mod warm_pool_tests {
     #[test]
     fn touch_promotes_to_most_recent() {
         let mut pool = WarmPool::new(1000);
-        pool.admit(p("a"), slot(), 400);
-        pool.admit(p("b"), slot(), 400);
+        pool.admit_preload(p("a"), slot(), 400);
+        pool.admit_preload(p("b"), slot(), 400);
         // Touching "a" should make "b" the eviction victim now.
         pool.touch(&p("a"));
-        pool.admit(p("c"), slot(), 400);
-        assert!(pool.lru.contains_key(&p("a")));
-        assert!(!pool.lru.contains_key(&p("b")));
-        assert!(pool.lru.contains_key(&p("c")));
+        pool.admit_preload(p("c"), slot(), 400);
+        assert!(pool.preload_lru.contains_key(&p("a")));
+        assert!(!pool.preload_lru.contains_key(&p("b")));
+        assert!(pool.preload_lru.contains_key(&p("c")));
     }
 
     #[test]
     fn touch_missing_path_is_noop() {
         let mut pool = WarmPool::new(1000);
         pool.touch(&p("nope"));
-        assert!(pool.lru.is_empty());
+        assert!(pool.preload_lru.is_empty());
+        assert!(pool.mmap_lru.is_empty());
     }
 
     #[test]
     fn pinned_entries_not_evicted() {
         let mut pool = WarmPool::new(1000);
-        pool.admit(p("a"), slot(), 600);
-        pool.admit(p("b"), slot(), 300);
+        pool.admit_preload(p("a"), slot(), 600);
+        pool.admit_preload(p("b"), slot(), 300);
         pool.pin(&p("a"));
 
         // "a" is pinned → "b" must be evicted to make room for "c" (400 fits
         // alongside pinned 600).
-        assert!(pool.admit(p("c"), slot(), 400));
-        assert!(pool.lru.contains_key(&p("a")));
-        assert!(!pool.lru.contains_key(&p("b")));
-        assert!(pool.lru.contains_key(&p("c")));
+        assert!(pool.admit_preload(p("c"), slot(), 400));
+        assert!(pool.preload_lru.contains_key(&p("a")));
+        assert!(!pool.preload_lru.contains_key(&p("b")));
+        assert!(pool.preload_lru.contains_key(&p("c")));
     }
 
     #[test]
     fn admit_fails_when_only_pinned_entries() {
         let mut pool = WarmPool::new(1000);
-        pool.admit(p("a"), slot(), 600);
-        pool.admit(p("b"), slot(), 300);
+        pool.admit_preload(p("a"), slot(), 600);
+        pool.admit_preload(p("b"), slot(), 300);
         pool.pin(&p("a"));
         pool.pin(&p("b"));
         // No evictable victims; admit must fail rather than overshoot budget.
-        assert!(!pool.admit(p("c"), slot(), 500));
+        assert!(!pool.admit_preload(p("c"), slot(), 500));
         assert_eq!(pool.current_bytes, 900);
     }
 
@@ -961,11 +1139,11 @@ mod warm_pool_tests {
     #[test]
     fn admit_existing_path_is_idempotent() {
         let mut pool = WarmPool::new(1000);
-        pool.admit(p("a"), slot(), 400);
+        pool.admit_preload(p("a"), slot(), 400);
         // Second admit with same path: no double-counting, returns true.
-        assert!(pool.admit(p("a"), slot(), 400));
+        assert!(pool.admit_preload(p("a"), slot(), 400));
         assert_eq!(pool.current_bytes, 400);
-        assert_eq!(pool.lru.len(), 1);
+        assert_eq!(pool.preload_lru.len(), 1);
     }
 
     #[test]
@@ -982,7 +1160,63 @@ mod warm_pool_tests {
     #[test]
     fn try_begin_load_skips_already_warm() {
         let mut pool = WarmPool::new(1000);
-        pool.admit(p("a"), slot(), 100);
+        pool.admit_preload(p("a"), slot(), 100);
         assert!(!pool.try_begin_load(&p("a")));
+    }
+
+    #[test]
+    fn preload_and_mmap_share_one_budget() {
+        // Both kinds count against the same budget and can coexist for the
+        // same path (single PinHandle on that path protects both).
+        let mut pool = WarmPool::new(1000);
+        let path = p("attack.wav");
+        let preload_slot = typed_slot();
+        let mmap_slot: Arc<ArcSwapOption<crate::wav_mmap::MmapSample>> =
+            Arc::new(ArcSwapOption::empty());
+        assert!(pool.admit_preload(path.clone(), preload_slot.clone(), 300));
+        assert!(pool.admit_mmap(path.clone(), mmap_slot.clone(), 400));
+        assert_eq!(pool.current_bytes, 700);
+        assert!(pool.preload_lru.contains_key(&path));
+        assert!(pool.mmap_lru.contains_key(&path));
+    }
+
+    #[test]
+    fn mmap_admission_evicts_oldest_unpinned_globally() {
+        // An old preload entry should be evicted to make room for a new
+        // mmap entry (eviction is across both LRUs by recency).
+        let mut pool = WarmPool::new(1000);
+        let s_old = typed_slot();
+        s_old.store(Some(Arc::new(PreloadHead::F32(Arc::new(vec![0.0; 4])))));
+        let mmap_slot: Arc<ArcSwapOption<crate::wav_mmap::MmapSample>> =
+            Arc::new(ArcSwapOption::empty());
+
+        pool.admit_preload(p("old"), s_old.clone(), 700);
+        // Need 400 more, only 300 free → must evict "old".
+        assert!(pool.admit_mmap(p("new"), mmap_slot, 400));
+        assert!(!pool.preload_lru.contains_key(&p("old")));
+        assert!(pool.mmap_lru.contains_key(&p("new")));
+        assert!(s_old.load_full().is_none());
+        assert_eq!(pool.current_bytes, 400);
+    }
+
+    #[test]
+    fn pin_protects_both_lrus_for_same_path() {
+        // A single pin on the attack-sample path must keep both the preload
+        // head and the mmap entry from being evicted.
+        let mut pool = WarmPool::new(1000);
+        let path = p("attack.wav");
+        let preload_slot = typed_slot();
+        preload_slot.store(Some(Arc::new(PreloadHead::F32(Arc::new(vec![0.0; 4])))));
+        let mmap_slot: Arc<ArcSwapOption<crate::wav_mmap::MmapSample>> =
+            Arc::new(ArcSwapOption::empty());
+        pool.admit_preload(path.clone(), preload_slot.clone(), 400);
+        pool.admit_mmap(path.clone(), mmap_slot.clone(), 400);
+        pool.pin(&path);
+
+        // Only 200 free; nothing else is unpinned → admit fails.
+        assert!(!pool.admit_preload(p("other"), slot(), 500));
+        assert!(pool.preload_lru.contains_key(&path));
+        assert!(pool.mmap_lru.contains_key(&path));
+        assert!(preload_slot.load_full().is_some());
     }
 }

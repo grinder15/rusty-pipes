@@ -767,7 +767,10 @@ pub fn load_sample_head(
     path: &Path,
     target_sample_rate: u32,
     max_frames: usize,
-) -> Result<Vec<f32>> {
+) -> Result<crate::preload::PreloadHead> {
+    use crate::preload::PreloadHead;
+    use std::sync::Arc;
+
     let file =
         File::open(path).with_context(|| format!("Failed to open sample head: {:?}", path))?;
     let mut reader = BufReader::new(file);
@@ -787,42 +790,89 @@ pub fn load_sample_head(
 
             let bytes_per_frame = (fmt.bits_per_sample / 8) as u32 * fmt.num_channels as u32;
             let total_frames = data_size / bytes_per_frame;
-            let frames_to_read = (max_frames as u32).min(total_frames);
+            let frames_to_read = (max_frames as u32).min(total_frames) as usize;
 
-            // Seek to data
             reader.seek(SeekFrom::Start(data_offset))?;
 
-            // We always output Stereo (2 channels) for the RingBuffer
-            let mut interleaved_stereo = Vec::with_capacity(frames_to_read as usize * 2);
+            // 16-bit PCM fast path: keep samples native (2 B/sample) instead
+            // of inflating to f32. The audio thread converts on push.
+            if fmt.audio_format == 1 && fmt.bits_per_sample == 16 {
+                let mut interleaved_stereo: Vec<i16> = Vec::with_capacity(frames_to_read * 2);
+                for _ in 0..frames_to_read {
+                    if fmt.num_channels == 1 {
+                        let s = reader.read_i16::<LittleEndian>()?;
+                        interleaved_stereo.push(s);
+                        interleaved_stereo.push(s);
+                    } else {
+                        let l = reader.read_i16::<LittleEndian>()?;
+                        let r = reader.read_i16::<LittleEndian>()?;
+                        interleaved_stereo.push(l);
+                        interleaved_stereo.push(r);
+                        // Skip extra channels beyond stereo.
+                        for _ in 2..fmt.num_channels {
+                            let _ = reader.read_i16::<LittleEndian>()?;
+                        }
+                    }
+                }
+                return Ok(crate::sample_codec::encode_or_passthrough(interleaved_stereo));
+            }
 
+            // 24-bit PCM dither path: when `force_16bit_storage` is on,
+            // collapse 24-bit sources to i16 with TPDF dither so they flow
+            // through the same compressed in-RAM path as native 16-bit.
+            if fmt.audio_format == 1
+                && fmt.bits_per_sample == 24
+                && crate::dither::force_16bit_storage()
+            {
+                use crate::dither::{dither_i24_to_i16, seed_from_path, DitherRng};
+                let mut rng_l = DitherRng::new(seed_from_path(path));
+                let mut rng_r =
+                    DitherRng::new(seed_from_path(path).wrapping_add(0x9E37_79B9_7F4A_7C15));
+                let mut interleaved_stereo: Vec<i16> = Vec::with_capacity(frames_to_read * 2);
+                for _ in 0..frames_to_read {
+                    if fmt.num_channels == 1 {
+                        let s24 = read_i24(&mut reader)?;
+                        let s = dither_i24_to_i16(s24, &mut rng_l);
+                        interleaved_stereo.push(s);
+                        interleaved_stereo.push(s);
+                    } else {
+                        let l24 = read_i24(&mut reader)?;
+                        let r24 = read_i24(&mut reader)?;
+                        interleaved_stereo
+                            .push(dither_i24_to_i16(l24, &mut rng_l));
+                        interleaved_stereo
+                            .push(dither_i24_to_i16(r24, &mut rng_r));
+                        for _ in 2..fmt.num_channels {
+                            let _ = read_i24(&mut reader)?;
+                        }
+                    }
+                }
+                return Ok(crate::sample_codec::encode_or_passthrough(interleaved_stereo));
+            }
+
+            // Fallback: 24-bit (toggle off), 32-bit, or float WAV — promote to f32.
+            let mut interleaved_stereo: Vec<f32> = Vec::with_capacity(frames_to_read * 2);
             for _ in 0..frames_to_read {
-                // Read all channels for this frame
                 let mut frame_samples = Vec::with_capacity(fmt.num_channels as usize);
-
                 for _ in 0..fmt.num_channels {
                     let sample_f32 = match (fmt.audio_format, fmt.bits_per_sample) {
                         (1, 16) => (reader.read_i16::<LittleEndian>()? as f32) / I16_MAX_F,
                         (1, 24) => (read_i24(&mut reader)? as f32) / I24_MAX_F,
                         (1, 32) => (reader.read_i32::<LittleEndian>()? as f32) / I32_MAX_F,
                         (3, 32) => reader.read_f32::<LittleEndian>()?,
-                        _ => 0.0, // Unsupported fallback
+                        _ => 0.0,
                     };
                     frame_samples.push(sample_f32);
                 }
-
-                // Push to output based on channel count
                 if fmt.num_channels == 1 {
-                    // Mono -> Stereo
-                    interleaved_stereo.push(frame_samples[0]); // L
-                    interleaved_stereo.push(frame_samples[0]); // R
+                    interleaved_stereo.push(frame_samples[0]);
+                    interleaved_stereo.push(frame_samples[0]);
                 } else {
-                    // Stereo (or take first 2 of multi-channel)
-                    interleaved_stereo.push(frame_samples[0]); // L
-                    interleaved_stereo.push(frame_samples[1]); // R
+                    interleaved_stereo.push(frame_samples[0]);
+                    interleaved_stereo.push(frame_samples[1]);
                 }
             }
-
-            Ok(interleaved_stereo)
+            Ok(PreloadHead::F32(Arc::new(interleaved_stereo)))
         }
         Err(e) if e.is::<IsWavPackError>() => {
             // --- WAVPACK PATH ---
@@ -894,7 +944,7 @@ pub fn load_sample_head(
                 }
             }
 
-            Ok(interleaved_stereo)
+            Ok(PreloadHead::F32(Arc::new(interleaved_stereo)))
         }
         Err(e) => {
             Err(e).with_context(|| format!("Failed to parse metadata for head load: {:?}", path))
@@ -1142,4 +1192,145 @@ pub fn try_extract_release_sample(
     writer.flush()?;
 
     Ok(Some(cache_full_path))
+}
+
+#[cfg(test)]
+mod load_head_tests {
+    use super::*;
+    use crate::preload::PreloadHead;
+    use byteorder::{LittleEndian, WriteBytesExt};
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    fn write_minimal_wav_pcm16(samples: &[i16], sample_rate: u32, channels: u16) -> NamedTempFile {
+        let mut f = NamedTempFile::new().unwrap();
+        let bits = 16u16;
+        let bytes_per_sample = (bits / 8) as u32;
+        let data_len = (samples.len() as u32) * bytes_per_sample;
+        let fmt_size = 16u32;
+        let riff_size = 4 + (8 + fmt_size) + (8 + data_len);
+        f.write_all(b"RIFF").unwrap();
+        f.write_u32::<LittleEndian>(riff_size).unwrap();
+        f.write_all(b"WAVE").unwrap();
+        f.write_all(b"fmt ").unwrap();
+        f.write_u32::<LittleEndian>(fmt_size).unwrap();
+        f.write_u16::<LittleEndian>(1).unwrap();
+        f.write_u16::<LittleEndian>(channels).unwrap();
+        f.write_u32::<LittleEndian>(sample_rate).unwrap();
+        f.write_u32::<LittleEndian>(sample_rate * channels as u32 * bytes_per_sample).unwrap();
+        f.write_u16::<LittleEndian>(channels * bytes_per_sample as u16).unwrap();
+        f.write_u16::<LittleEndian>(bits).unwrap();
+        f.write_all(b"data").unwrap();
+        f.write_u32::<LittleEndian>(data_len).unwrap();
+        for s in samples { f.write_i16::<LittleEndian>(*s).unwrap(); }
+        f.flush().unwrap();
+        f
+    }
+
+    fn decode_head_to_i16(head: &PreloadHead) -> Vec<i16> {
+        use ringbuf::traits::{Consumer, Split};
+        use ringbuf::HeapRb;
+        let frames = head.frame_count();
+        let rb = HeapRb::<f32>::new(frames * 2 + 16);
+        let (mut prod, mut cons) = rb.split();
+        head.push_into(&mut prod);
+        let mut out = vec![0.0f32; frames * 2];
+        let n = cons.pop_slice(&mut out);
+        out.truncate(n);
+        out.iter()
+            .map(|f| (f * 32768.0).round() as i32 as i16)
+            .collect()
+    }
+
+    #[test]
+    fn loads_16bit_stereo_native_or_compressed_roundtrips() {
+        // The codec may compress this short sequence; either way the
+        // decoded f32 stream must reconstruct the original samples.
+        let pcm: Vec<i16> = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let f = write_minimal_wav_pcm16(&pcm, 48000, 2);
+        let head = load_sample_head(f.path(), 48000, 100).unwrap();
+        assert!(matches!(
+            head,
+            PreloadHead::I16(_) | PreloadHead::Compressed(_)
+        ));
+        assert_eq!(decode_head_to_i16(&head), pcm);
+    }
+
+    #[test]
+    fn loads_mono_16bit_duplicates_to_stereo() {
+        let pcm: Vec<i16> = vec![10, 20, 30];
+        let f = write_minimal_wav_pcm16(&pcm, 48000, 1);
+        let head = load_sample_head(f.path(), 48000, 100).unwrap();
+        assert_eq!(decode_head_to_i16(&head), &[10, 10, 20, 20, 30, 30]);
+    }
+
+    fn write_minimal_wav_pcm24(samples_i32: &[i32], sample_rate: u32, channels: u16) -> NamedTempFile {
+        let mut f = NamedTempFile::new().unwrap();
+        let bits = 24u16;
+        let bytes_per_sample = (bits / 8) as u32;
+        let data_len = (samples_i32.len() as u32) * bytes_per_sample;
+        let fmt_size = 16u32;
+        let riff_size = 4 + (8 + fmt_size) + (8 + data_len);
+        f.write_all(b"RIFF").unwrap();
+        f.write_u32::<LittleEndian>(riff_size).unwrap();
+        f.write_all(b"WAVE").unwrap();
+        f.write_all(b"fmt ").unwrap();
+        f.write_u32::<LittleEndian>(fmt_size).unwrap();
+        f.write_u16::<LittleEndian>(1).unwrap();
+        f.write_u16::<LittleEndian>(channels).unwrap();
+        f.write_u32::<LittleEndian>(sample_rate).unwrap();
+        f.write_u32::<LittleEndian>(sample_rate * channels as u32 * bytes_per_sample).unwrap();
+        f.write_u16::<LittleEndian>(channels * bytes_per_sample as u16).unwrap();
+        f.write_u16::<LittleEndian>(bits).unwrap();
+        f.write_all(b"data").unwrap();
+        f.write_u32::<LittleEndian>(data_len).unwrap();
+        for s in samples_i32 {
+            let raw = (*s as u32) & 0x00FF_FFFF;
+            f.write_all(&[raw as u8, (raw >> 8) as u8, (raw >> 16) as u8]).unwrap();
+        }
+        f.flush().unwrap();
+        f
+    }
+
+    #[test]
+    fn load_sample_head_24bit_returns_compressed_when_force_16bit_enabled() {
+        let prev = crate::dither::force_16bit_storage();
+        crate::dither::set_force_16bit_storage(true);
+        // Slowly-varying ramp: dither output should compress.
+        let samples_24: Vec<i32> = (0..2048).map(|i| (i as i32) * 1024).collect();
+        let f = write_minimal_wav_pcm24(&samples_24, 48000, 2);
+        let head = load_sample_head(f.path(), 48000, samples_24.len() / 2).unwrap();
+        crate::dither::set_force_16bit_storage(prev);
+        assert!(
+            matches!(head, PreloadHead::Compressed(_) | PreloadHead::I16(_)),
+            "expected i16 path under force_16bit_storage, got {:?}", head
+        );
+    }
+
+    #[test]
+    fn load_sample_head_24bit_returns_f32_when_force_16bit_disabled() {
+        let prev = crate::dither::force_16bit_storage();
+        crate::dither::set_force_16bit_storage(false);
+        let samples_24: Vec<i32> = (0..32).map(|i| (i as i32) * 1024).collect();
+        let f = write_minimal_wav_pcm24(&samples_24, 48000, 2);
+        let head = load_sample_head(f.path(), 48000, samples_24.len() / 2).unwrap();
+        crate::dither::set_force_16bit_storage(prev);
+        assert!(matches!(head, PreloadHead::F32(_)), "expected f32 fallback, got {:?}", head);
+    }
+
+    #[test]
+    fn loads_redundant_16bit_as_compressed() {
+        // Smooth ramp: residuals tiny, varint encoder shrinks below raw.
+        let pcm: Vec<i16> = (0..4096).map(|i| (i as i16) / 4).collect();
+        let f = write_minimal_wav_pcm16(&pcm, 48000, 2);
+        let head = load_sample_head(f.path(), 48000, pcm.len() / 2).unwrap();
+        match head {
+            PreloadHead::Compressed(p) => {
+                assert!(p.encoded.len() < pcm.len() * 2);
+                assert_eq!(p.frame_count, pcm.len() / 2);
+            }
+            PreloadHead::I16(_) => panic!("expected compressed for slowly-varying data"),
+            _ => panic!("unexpected variant"),
+        }
+    }
 }
