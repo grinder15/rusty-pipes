@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 use crate::preload::{PreloadHead, WarmSlot};
+use crate::sample_cache::CachedSample;
 use crate::wav_converter;
 use crate::wav_converter::SampleMetadata;
 
@@ -27,7 +28,7 @@ pub struct Organ {
     pub tremulants: HashMap<String, Tremulant>, // Keyed by tremulant ID (e.g. "001")
     pub base_path: PathBuf,           // The directory containing the .organ file
     pub cache_path: PathBuf,          // The directory for cached converted samples
-    pub sample_cache: Option<HashMap<PathBuf, Arc<Vec<f32>>>>, // Cache for loaded samples
+    pub sample_cache: Option<HashMap<PathBuf, Arc<CachedSample>>>, // Cache for loaded samples (compressed where possible)
     pub metadata_cache: Option<HashMap<PathBuf, Arc<SampleMetadata>>>, // Cache for loop points etc.
 
     /// Per-file frame count used for warmup head loads. Set during `load`.
@@ -981,12 +982,12 @@ impl Organ {
         let loaded_sample_count = AtomicUsize::new(0);
         log::info!("[Cache] Loading {} unique samples...", total_samples);
 
-        let results: Vec<Result<(PathBuf, Arc<Vec<f32>>, Arc<SampleMetadata>)>> = paths_to_load
+        let results: Vec<Result<(PathBuf, Arc<CachedSample>, Arc<SampleMetadata>)>> = paths_to_load
             .par_iter()
             .map(|path| {
                 // This closure runs on a different thread
-                let (samples, metadata) =
-                    wav_converter::load_sample_as_f32(path, target_sample_rate)
+                let (sample, metadata) =
+                    wav_converter::load_sample_as_cached(path, target_sample_rate)
                         .with_context(|| format!("Failed to load sample {:?}", path))?;
 
                 // Report progress atomically
@@ -998,19 +999,51 @@ impl Organ {
                         let _ = tx.send((progress, t!("gui.progress_load_ram").to_string()));
                     }
                 }
-                Ok((path.clone(), Arc::new(samples), Arc::new(metadata)))
+                Ok((path.clone(), Arc::new(sample), Arc::new(metadata)))
             })
             .collect();
 
         let sample_cache = self.sample_cache.as_mut().unwrap();
         let metadata_cache = self.metadata_cache.as_mut().unwrap();
 
+        let mut compressed_bytes: u64 = 0;
+        let mut raw_f32_bytes: u64 = 0;
+        let mut n_compressed = 0usize;
+        let mut n_i16 = 0usize;
+        let mut n_f32 = 0usize;
         for result in results {
-            if let Ok((path, samples, metadata)) = result {
-                sample_cache.insert(path.clone(), samples);
+            if let Ok((path, sample, metadata)) = result {
+                compressed_bytes += sample.byte_size() as u64;
+                raw_f32_bytes += (sample.total_frames()
+                    * crate::voice::CHANNEL_COUNT
+                    * std::mem::size_of::<f32>()) as u64;
+                match sample.as_ref() {
+                    CachedSample::Compressed { .. } => n_compressed += 1,
+                    CachedSample::I16 { .. } => n_i16 += 1,
+                    CachedSample::F32 { .. } => n_f32 += 1,
+                }
+                sample_cache.insert(path.clone(), sample);
                 metadata_cache.insert(path, metadata);
             }
         }
+        let mib = |b: u64| (b as f64) / (1024.0 * 1024.0);
+        let saved = raw_f32_bytes.saturating_sub(compressed_bytes);
+        let pct = if raw_f32_bytes > 0 {
+            (saved as f64) * 100.0 / (raw_f32_bytes as f64)
+        } else {
+            0.0
+        };
+        log::info!(
+            "[Cache] Loaded {} samples: {:.1} MiB stored vs {:.1} MiB raw f32 (saved {:.1} MiB, {:.1}%) — variants: {} compressed, {} i16, {} f32",
+            n_compressed + n_i16 + n_f32,
+            mib(compressed_bytes),
+            mib(raw_f32_bytes),
+            mib(saved),
+            pct,
+            n_compressed,
+            n_i16,
+            n_f32,
+        );
         Ok(())
     }
 }

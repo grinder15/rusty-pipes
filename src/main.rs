@@ -39,6 +39,7 @@ mod organ;
 mod organ_grandorgue;
 mod organ_hauptwerk;
 mod preload;
+mod sample_cache;
 mod sample_codec;
 mod sample_sidecar;
 mod tui;

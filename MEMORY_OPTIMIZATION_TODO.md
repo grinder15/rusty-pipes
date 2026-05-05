@@ -629,6 +629,120 @@ For 24-bit with `force_16bit_storage=true`:
 
 ---
 
+# CPU-focused follow-ups (from rank/release/reverb audit)
+
+The items above target RAM. The three below came out of an audit of the
+playback hot path (note-off release selection, voice ring buffers,
+convolution reverb). They're mostly CPU / latency wins, listed here so
+the optimisation backlog stays in one place.
+
+---
+
+## 12. Pre-sort `Pipe::releases` by `max_key_press_time_ms`
+
+**Today:** on every note-off, `audio_event.rs:93-99` linearly scans
+`pipe.releases` looking for the first entry whose
+`max_key_press_time_ms == -1` (default) or `>= press_duration`. The
+scan runs unconditionally — even when there's only one release the
+match arm walks the iterator. For pipes with 2–3 releases (typical
+short/medium/long sample sets) the cost is microseconds, but the work
+sits on the MIDI-handling path and is repeated for every released key
+in chord-off events.
+
+**Fix:** sort `releases` ascending by `max_key_press_time_ms` once at
+`Pipe` construction (`src/organ.rs`, `src/organ_grandorgue.rs`,
+`src/organ_hauptwerk.rs`) — entries with `-1` go last. Replace the
+linear scan with a binary search (`partition_point`).
+
+**Effort:** small. One sort at load, one search-by-key on note-off.
+
+**Risk:** low — selection semantics unchanged; covered by any existing
+release-selection tests plus a new "sorted slice picks the same release
+as the linear scan" test over a synthetic pipe.
+
+**Benefit:** marginal CPU saving on burst note-offs, cleaner code, and
+the load-time sort is a natural place to hang future invariants
+(e.g., asserting at most one `-1` sentinel).
+
+---
+
+## 13. Convolver IR truncation + partition-size review
+
+**Today:** `audio_convolver.rs` instantiates `fft-convolver` with
+block size = `buffer_size_frames` (typically 512–2048) and feeds the
+**entire** stereo IR (`ir_samples_interleaved`) into it. No tail
+truncation, no explicit partitioning strategy beyond what the crate
+does internally.
+
+**Suspected issues** (need profiling to confirm before acting):
+
+- IRs longer than ~4 s carry a tail well below −60 dBFS that contributes
+  nothing audible but is convolved every block.
+- If `fft-convolver` is doing a single FFT per block (not uniform
+  partitioned), CPU is dominated by one large FFT regardless of the
+  IR's actual energy distribution.
+
+**Fix (only if profiling shows convolution > ~3% of audio-thread CPU):**
+
+1. Truncate IR at the point where trailing energy drops below a
+   user-configurable threshold (default −60 dB), with a short raised-
+   cosine fade-out over the last 50 ms to avoid clicks.
+2. If the crate's strategy is single-FFT, switch to a uniform-partitioned
+   convolver (the same crate may expose this, or `realfft` + a small
+   partition wrapper). Smooths per-block CPU and reduces worst-case
+   spikes when block sizes happen to be unfavourable.
+
+**Risk:** medium — audible quality regression possible, especially on
+cathedral IRs where late reverb is part of the sound. Gate behind a
+per-organ config option ("reverb tail trim" with a dB threshold).
+
+**Effort:** truncation is small (one-time IR pre-processing at load
+time); partition swap is medium and only worth it if profiling
+demands it.
+
+**Status:** speculative until measured. Treat this item as "investigate
+before implementing" — the audit found no evidence the convolver is
+currently a hotspot.
+
+---
+
+## 14. `MADV_DONTNEED` on completed release voices (Linux/Android)
+
+**Today:** when a release voice finishes playing, its mmap pages stay
+resident in the page cache until the kernel evicts them under
+pressure. On glibc systems this can take a long time and contributes
+to the RSS-ratchet that item 4 (jemalloc) addresses for anon pages.
+
+**Fix:** when a release `Voice` is reaped, if the underlying
+`MmapSample` backend was used and the warm-pool admission has been
+released, call `madvise(MADV_DONTNEED)` on the byte range that was
+read during playback. The kernel can then drop those pages
+immediately under pressure without re-reading file metadata.
+
+**Caveats:**
+
+- Only apply this for *release* samples that just finished — never
+  for attack samples that may be re-triggered moments later by the
+  same key.
+- On Android `MADV_DONTNEED` semantics match Linux. iOS doesn't
+  expose it the same way (`posix_madvise` has weaker semantics);
+  the call should be a no-op there.
+- If item 4 (jemalloc) lands first, the win here is smaller because
+  most of the ratchet behaviour is anon-page allocator hoarding, not
+  page-cache stickiness.
+
+**Effort:** small — one helper in `wav_mmap.rs` plus a call site in
+the voice-reaping path in `audio.rs`.
+
+**Risk:** low. Worst case the kernel re-reads the pages on next
+access; we already tolerate that on the cold path.
+
+**Benefit:** modest — tighter file-backed RSS on long sessions on
+constrained devices. Skip if profiling on the target device shows
+file-backed RSS already plateaus where expected.
+
+---
+
 ## Suggested ordering
 
 Items 7+8 are the biggest mobile-RAM wins; everything else is
@@ -647,6 +761,9 @@ supporting work or polish.
 | **4** | Switch global allocator to jemalloc | Trivial code change but needs per-platform testing. Do once the structural work lands. | |
 | **5** | Mobile OS-level enforcement (cgroups / jetsam) | Packaging concern, not code. Final piece of the "guaranteed ceiling". | |
 | **6** | UI label tweak for the slider | Cosmetic. Anytime convenient. | |
+| **12** | Pre-sort `Pipe::releases`, binary-search on note-off | Independent of the codec work. Tiny CPU win + cleaner code. | |
+| **13** | Convolver IR truncation + partition review | **Profile first.** Only if convolution shows up as a hotspot. Risk of audible regression. | |
+| **14** | `MADV_DONTNEED` on completed release voices | Marginal; do *after* #4 lands so the remaining ratchet is measured against a jemalloc baseline. | |
 
 **Phases at a glance:**
 
@@ -656,6 +773,8 @@ supporting work or polish.
 4. **Close the precache gap** — #11 (the largest remaining mobile-RAM
    win; also fixes the audio-thread decode stall under burst load).
 5. **Polish & guardrails** — #3, #4, #5, #6.
+6. **CPU-side cleanup** — #12 (cheap), #14 (after #4), #13 (only if
+   profiled).
 
 After #7 + #2 + #8 you should be in GrandOrgue territory on 16-bit
 corpora (~300–400 MB for 10 stops). #9 is the mobile-specific win

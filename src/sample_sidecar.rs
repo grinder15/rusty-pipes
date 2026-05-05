@@ -42,7 +42,7 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use crate::dither::{dither_i24_to_i16, seed_from_path, DitherRng};
-use crate::sample_codec::{advance, encode_residual, predict, PredictorState};
+use crate::sample_codec::encode_blocks_from_i16_iter;
 use crate::voice::CHANNEL_COUNT;
 use crate::wav::{parse_wav_metadata, parse_smpl_chunk};
 /// Read a 24-bit signed little-endian sample from a 3-byte slice.
@@ -177,41 +177,6 @@ pub fn parse_header_and_index(
     ))
 }
 
-/// Encode a sequence of stereo i16 frames into a list of independently
-/// decodable blocks. Each block restarts the predictor, so the block index
-/// doubles as the seek table. Used by both the 16-bit passthrough and the
-/// 24-bit-dithered write paths.
-fn encode_blocks_from_i16_iter<I>(frames: I, total_frames: usize) -> Vec<Vec<u8>>
-where
-    I: IntoIterator<Item = [i16; CHANNEL_COUNT]>,
-{
-    let frames_per_block = FRAMES_PER_BLOCK as usize;
-    let block_count = total_frames.div_ceil(frames_per_block).max(1);
-    let mut blocks: Vec<Vec<u8>> = Vec::with_capacity(block_count);
-    let mut current: Vec<u8> = Vec::with_capacity(frames_per_block * 2);
-    let mut state = [PredictorState::default(); CHANNEL_COUNT];
-    let mut frame_idx_in_block: usize = 0;
-
-    for frame in frames {
-        if frame_idx_in_block == frames_per_block {
-            blocks.push(std::mem::take(&mut current));
-            state = [PredictorState::default(); CHANNEL_COUNT];
-            frame_idx_in_block = 0;
-        }
-        for ch in 0..CHANNEL_COUNT {
-            let s = frame[ch];
-            let pred = predict(&state[ch]);
-            encode_residual(&mut current, s as i32 - pred);
-            advance(&mut state[ch], s);
-        }
-        frame_idx_in_block += 1;
-    }
-    if !current.is_empty() || blocks.is_empty() {
-        blocks.push(current);
-    }
-    blocks
-}
-
 /// Write a finalised list of encoded blocks + header to `sidecar_path`
 /// atomically (via `.tmp` + rename).
 fn write_sidecar_bytes(
@@ -339,7 +304,7 @@ pub fn write_sidecar_for_pcm_dithered_to_16(
             };
             [l, r]
         });
-        encode_blocks_from_i16_iter(frames, total_frames)
+        encode_blocks_from_i16_iter(frames, total_frames, FRAMES_PER_BLOCK as usize)
     } else {
         let mut rng_l = DitherRng::new(seed_from_path(wav_path));
         let mut rng_r = DitherRng::new(seed_from_path(wav_path).wrapping_add(0x9E37_79B9_7F4A_7C15));
@@ -356,7 +321,7 @@ pub fn write_sidecar_for_pcm_dithered_to_16(
             let r = dither_i24_to_i16(r24, &mut rng_r);
             buf.push([l, r]);
         }
-        encode_blocks_from_i16_iter(buf, total_frames)
+        encode_blocks_from_i16_iter(buf, total_frames, FRAMES_PER_BLOCK as usize)
     };
 
     write_sidecar_bytes(

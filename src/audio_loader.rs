@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 
+use crate::sample_cache::CachedSample;
 use crate::voice::{CHANNEL_COUNT, SpawnJob};
 use crate::wav::{WavSampleReader, parse_smpl_chunk, parse_wav_metadata};
 use crate::wav_mmap::{MmapPlayback, MmapSample};
@@ -41,96 +42,100 @@ pub fn run_loader_job(mut job: SpawnJob) {
         return;
     }
 
+    // Cache fast path: precached sample lives in `Organ::sample_cache` as
+    // a `CachedSample` (item #11). Drive playback through `CachedPlayback`
+    // so 16-bit and dithered-24-bit data stays compressed end-to-end —
+    // decode happens on this loader thread, not the audio thread.
+    let maybe_cached_sample = job
+        .organ
+        .sample_cache
+        .as_ref()
+        .and_then(|c| c.get(&job.path).cloned());
+    let maybe_cached_meta = job
+        .organ
+        .metadata_cache
+        .as_ref()
+        .and_then(|c| c.get(&job.path).cloned());
+
+    if let (Some(sample), Some(meta)) = (maybe_cached_sample, maybe_cached_meta) {
+        let loop_info = if job.is_attack_sample {
+            meta.loop_info
+        } else {
+            None
+        };
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_cache_playback(&mut job, &sample, loop_info);
+        }));
+        if let Err(e) = panic_result {
+            log::error!(
+                "[LoaderThread] cache path PANICKED for {:?}: {:?}",
+                path_str_clone, e
+            );
+        }
+        job.is_finished.store(true, Ordering::SeqCst);
+        return;
+    }
+
     // Wrap in catch_unwind to prevent a loader panic from crashing the whole engine
     let panic_result = std::panic::catch_unwind(move || {
         let result: Result<()> = (|| {
-            // Check Caches
-            let maybe_cached_data = job
-                .organ
-                .sample_cache
-                .as_ref()
-                .and_then(|c| c.get(&job.path).cloned());
-            let maybe_cached_meta = job
-                .organ
-                .metadata_cache
-                .as_ref()
-                .and_then(|c| c.get(&job.path).cloned());
+            // Slow Path: Disk I/O (cache miss)
+            let file = File::open(&job.path)?;
+            let mut reader = BufReader::new(file);
+            let (fmt, other_chunks, data_start, data_size) =
+                parse_wav_metadata(&mut reader, &job.path)?;
 
-            let loop_info;
-            let input_channels;
+            if fmt.sample_rate != job.sample_rate {
+                return Err(anyhow!("Rate mismatch"));
+            }
+
+            let mut loop_info_from_file = None;
+            for chunk in other_chunks {
+                if &chunk.id == b"smpl" {
+                    loop_info_from_file = parse_smpl_chunk(&chunk.data);
+                    break;
+                }
+            }
+            let loop_info = if job.is_attack_sample {
+                loop_info_from_file
+            } else {
+                None
+            };
+            let input_channels = fmt.num_channels as usize;
+            let frames_to_skip = job.frames_to_skip;
+
+            let decoder = WavSampleReader::new(reader, fmt, data_start, data_size)?;
+
+            let mut interleaved_buffer = vec![0.0f32; 1024 * CHANNEL_COUNT];
             let mut source: Option<Box<dyn Iterator<Item = f32>>> = None;
             let mut source_is_finished;
             let use_memory_reader;
             let mut samples_in_memory: Vec<f32> = Vec::new();
 
-            let mut interleaved_buffer = vec![0.0f32; 1024 * CHANNEL_COUNT];
-            let frames_to_skip = job.frames_to_skip;
-
-            if let (Some(cached_samples), Some(cached_metadata)) =
-                (maybe_cached_data, maybe_cached_meta)
-            {
-                // Fast Path: Memory Cache
-                samples_in_memory = (*cached_samples).clone();
-                loop_info = if job.is_attack_sample {
-                    cached_metadata.loop_info
-                } else {
-                    None
-                };
-                input_channels = cached_metadata.channel_count as usize;
+            if job.is_attack_sample && loop_info.is_some() {
+                // Small looping samples must be fully loaded into memory
+                samples_in_memory = decoder.collect();
                 use_memory_reader = true;
                 source_is_finished = false;
             } else {
-                // Slow Path: Disk I/O
-                let file = File::open(&job.path)?;
-                let mut reader = BufReader::new(file);
-                let (fmt, other_chunks, data_start, data_size) =
-                    parse_wav_metadata(&mut reader, &job.path)?;
+                // Long one-shot samples are streamed
+                let mut iterator = Box::new(decoder);
 
-                if fmt.sample_rate != job.sample_rate {
-                    return Err(anyhow!("Rate mismatch"));
-                }
-
-                let mut loop_info_from_file = None;
-                for chunk in other_chunks {
-                    if &chunk.id == b"smpl" {
-                        loop_info_from_file = parse_smpl_chunk(&chunk.data);
-                        break;
-                    }
-                }
-                loop_info = if job.is_attack_sample {
-                    loop_info_from_file
-                } else {
-                    None
-                };
-                input_channels = fmt.num_channels as usize;
-
-                let decoder = WavSampleReader::new(reader, fmt, data_start, data_size)?;
-
-                if job.is_attack_sample && loop_info.is_some() {
-                    // Small looping samples must be fully loaded into memory
-                    samples_in_memory = decoder.collect();
-                    use_memory_reader = true;
-                    source_is_finished = false;
-                } else {
-                    // Long one-shot samples are streamed
-                    let mut iterator = Box::new(decoder);
-
-                    // Skip frames (e.g. if we had preloaded bytes)
-                    let mut skip_successful = true;
-                    if frames_to_skip > 0 {
-                        let samples_to_skip = frames_to_skip * input_channels;
-                        for _ in 0..samples_to_skip {
-                            if iterator.next().is_none() {
-                                skip_successful = false;
-                                break;
-                            }
+                // Skip frames (e.g. if we had preloaded bytes)
+                let mut skip_successful = true;
+                if frames_to_skip > 0 {
+                    let samples_to_skip = frames_to_skip * input_channels;
+                    for _ in 0..samples_to_skip {
+                        if iterator.next().is_none() {
+                            skip_successful = false;
+                            break;
                         }
                     }
-
-                    source_is_finished = !skip_successful;
-                    source = Some(iterator);
-                    use_memory_reader = false;
                 }
+
+                source_is_finished = !skip_successful;
+                source = Some(iterator);
+                use_memory_reader = false;
             }
 
             let is_mono = input_channels == 1;
@@ -174,7 +179,6 @@ pub fn run_loader_job(mut job: SpawnJob) {
                         }
 
                         let sample_l_idx = current_frame_index * input_channels;
-                        // Manual safety checks removed for brevity, but indices are bounded above
                         let sample_l = samples_in_memory.get(sample_l_idx).cloned().unwrap_or(0.0);
                         let sample_r = if is_mono {
                             sample_l
@@ -260,6 +264,122 @@ pub fn run_loader_job(mut job: SpawnJob) {
     }
 
     job.is_finished.store(true, Ordering::SeqCst);
+}
+
+/// Playback path for samples held in `Organ::sample_cache` as a
+/// `CachedSample` (item #11). Mirrors `run_mmap_playback` — block-cursor
+/// reads, no per-voice `Vec<f32>` allocation, predictor decode happens
+/// here on the loader thread.
+fn run_cache_playback(
+    job: &mut SpawnJob,
+    sample: &Arc<CachedSample>,
+    loop_info: Option<(u32, u32)>,
+) {
+    let total_frames = sample.total_frames();
+    if total_frames == 0 {
+        return;
+    }
+
+    let (loop_start, loop_end_raw) = loop_info.unwrap_or((0, 0));
+    let loop_start_frame = loop_start as usize;
+    let loop_end_frame = if loop_end_raw == 0 {
+        total_frames
+    } else {
+        loop_end_raw as usize
+    };
+    let is_looping = loop_info.is_some()
+        && loop_start_frame < loop_end_frame
+        && loop_end_frame <= total_frames;
+
+    let mut current_frame: usize = job.frames_to_skip;
+    if current_frame >= total_frames && !is_looping {
+        return;
+    }
+    if is_looping && current_frame >= loop_end_frame {
+        current_frame = loop_start_frame;
+    }
+
+    let frames_per_chunk = 1024usize;
+    let mut interleaved = vec![0.0f32; frames_per_chunk * CHANNEL_COUNT];
+    let mut play = sample.playback();
+
+    // Guard against a corrupt/undecodable block pinning this loader thread:
+    // if `play.read` returns 0 frames many iterations in a row with no other
+    // progress, bail out instead of spinning forever at 1ms ticks.
+    const MAX_ZERO_PROGRESS_ITERS: u32 = 64;
+    let mut zero_progress_iters: u32 = 0;
+
+    'playback: loop {
+        if job.is_cancelled.load(Ordering::Relaxed) {
+            break 'playback;
+        }
+
+        let mut frames_read = 0usize;
+        while frames_read < frames_per_chunk {
+            if is_looping {
+                if current_frame >= loop_end_frame {
+                    current_frame = loop_start_frame;
+                }
+            } else if current_frame >= total_frames {
+                break;
+            }
+
+            let frames_left_in_chunk = frames_per_chunk - frames_read;
+            let frames_until_boundary = if is_looping {
+                loop_end_frame.saturating_sub(current_frame)
+            } else {
+                total_frames.saturating_sub(current_frame)
+            };
+            let want = frames_left_in_chunk.min(frames_until_boundary);
+            if want == 0 {
+                break;
+            }
+            let dest_start = frames_read * CHANNEL_COUNT;
+            let dest_end = dest_start + want * CHANNEL_COUNT;
+            let n = play.read(current_frame, &mut interleaved[dest_start..dest_end]);
+            if n == 0 {
+                break;
+            }
+            current_frame += n;
+            frames_read += n;
+        }
+
+        if frames_read > 0 {
+            let to_push = frames_read * CHANNEL_COUNT;
+            let mut offset = 0;
+            while offset < to_push {
+                if job.is_cancelled.load(Ordering::Relaxed) {
+                    break 'playback;
+                }
+                let pushed = job.producer.push_slice(&interleaved[offset..to_push]);
+                offset += pushed;
+                if offset < to_push {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+
+        if !is_looping && current_frame >= total_frames {
+            break 'playback;
+        }
+        if frames_read == 0 {
+            zero_progress_iters += 1;
+            if zero_progress_iters >= MAX_ZERO_PROGRESS_ITERS {
+                log::warn!(
+                    "[LoaderThread] cache playback stalled at frame {} for {:?}; aborting",
+                    current_frame, job.path
+                );
+                break 'playback;
+            }
+            if is_looping {
+                thread::sleep(Duration::from_millis(1));
+            } else {
+                break 'playback;
+            }
+        } else {
+            zero_progress_iters = 0;
+        }
+    }
 }
 
 /// Playback path for attack samples backed by an mmap. Decodes frames

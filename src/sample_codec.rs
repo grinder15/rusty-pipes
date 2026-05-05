@@ -184,6 +184,46 @@ pub fn encode_or_passthrough(samples: Vec<i16>) -> PreloadHead {
 
 const I16_TO_F32: f32 = 1.0 / 32768.0;
 
+/// Encode a sequence of stereo i16 frames into a list of independently
+/// decodable blocks. Each block restarts the predictor from zero state, so
+/// the caller can build a block index that doubles as a seek table — used
+/// by both the on-disk sidecar (`sample_sidecar.rs`) and the in-RAM cache
+/// (`sample_cache.rs`).
+pub(crate) fn encode_blocks_from_i16_iter<I>(
+    frames: I,
+    total_frames: usize,
+    frames_per_block: usize,
+) -> Vec<Vec<u8>>
+where
+    I: IntoIterator<Item = [i16; CHANNEL_COUNT]>,
+{
+    assert!(frames_per_block > 0, "frames_per_block must be > 0");
+    let block_count = total_frames.div_ceil(frames_per_block).max(1);
+    let mut blocks: Vec<Vec<u8>> = Vec::with_capacity(block_count);
+    let mut current: Vec<u8> = Vec::with_capacity(frames_per_block * 2);
+    let mut state = [PredictorState::default(); CHANNEL_COUNT];
+    let mut frame_idx_in_block: usize = 0;
+
+    for frame in frames {
+        if frame_idx_in_block == frames_per_block {
+            blocks.push(std::mem::take(&mut current));
+            state = [PredictorState::default(); CHANNEL_COUNT];
+            frame_idx_in_block = 0;
+        }
+        for ch in 0..CHANNEL_COUNT {
+            let s = frame[ch];
+            let pred = predict(&state[ch]);
+            encode_residual(&mut current, s as i32 - pred);
+            advance(&mut state[ch], s);
+        }
+        frame_idx_in_block += 1;
+    }
+    if !current.is_empty() || blocks.is_empty() {
+        blocks.push(current);
+    }
+    blocks
+}
+
 /// Linear, start-to-end decoder for `CompressedPayload`. Construct fresh,
 /// drive `decode_chunk` until it returns 0 frames, then drop. Stateless
 /// across instances; safe to construct on the audio thread.

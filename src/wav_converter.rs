@@ -479,6 +479,177 @@ pub fn load_sample_as_f32(
     }
 }
 
+/// Loads an entire sample into a `CachedSample` — the in-RAM analogue of
+/// `load_sample_head` but for the precache path. Mirrors the same 16/24/
+/// float dispatch so 16-bit and (with `force_16bit_storage`) 24-bit corpora
+/// flow through the predictor codec instead of inflating to f32.
+pub fn load_sample_as_cached(
+    path: &Path,
+    target_sample_rate: u32,
+) -> Result<(crate::sample_cache::CachedSample, SampleMetadata)> {
+    use crate::sample_cache::CachedSample;
+
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+
+    match crate::wav::parse_wav_metadata(&mut reader, path) {
+        Ok((fmt, other_chunks, data_offset, data_size)) => {
+            if fmt.sample_rate != target_sample_rate {
+                return Err(anyhow!(
+                    "Sample rate mismatch in cache: {} != {}",
+                    fmt.sample_rate,
+                    target_sample_rate
+                ));
+            }
+
+            let mut loop_info = None;
+            for chunk in other_chunks {
+                if &chunk.id == b"smpl" {
+                    loop_info = parse_smpl_chunk(&chunk.data);
+                    break;
+                }
+            }
+            let metadata = SampleMetadata {
+                loop_info,
+                channel_count: fmt.num_channels,
+            };
+
+            let bytes_per_frame = (fmt.bits_per_sample / 8) as u32 * fmt.num_channels as u32;
+            if bytes_per_frame == 0 {
+                return Ok((CachedSample::from_f32_stereo(Vec::new()), metadata));
+            }
+            let total_frames = (data_size / bytes_per_frame) as usize;
+            reader.seek(SeekFrom::Start(data_offset))?;
+
+            // 16-bit PCM fast path → predictor codec (or i16 fallback).
+            if fmt.audio_format == 1 && fmt.bits_per_sample == 16 {
+                let mut interleaved: Vec<i16> = Vec::with_capacity(total_frames * 2);
+                for _ in 0..total_frames {
+                    if fmt.num_channels == 1 {
+                        let s = reader.read_i16::<LittleEndian>()?;
+                        interleaved.push(s);
+                        interleaved.push(s);
+                    } else {
+                        let l = reader.read_i16::<LittleEndian>()?;
+                        let r = reader.read_i16::<LittleEndian>()?;
+                        interleaved.push(l);
+                        interleaved.push(r);
+                        for _ in 2..fmt.num_channels {
+                            let _ = reader.read_i16::<LittleEndian>()?;
+                        }
+                    }
+                }
+                return Ok((CachedSample::from_pcm16_stereo(interleaved), metadata));
+            }
+
+            // 24-bit PCM + force_16bit → dither → predictor codec.
+            if fmt.audio_format == 1
+                && fmt.bits_per_sample == 24
+                && crate::dither::force_16bit_storage()
+            {
+                use crate::dither::{dither_i24_to_i16, seed_from_path, DitherRng};
+                let mut rng_l = DitherRng::new(seed_from_path(path));
+                let mut rng_r = DitherRng::new(
+                    seed_from_path(path).wrapping_add(0x9E37_79B9_7F4A_7C15),
+                );
+                let mut interleaved: Vec<i16> = Vec::with_capacity(total_frames * 2);
+                for _ in 0..total_frames {
+                    if fmt.num_channels == 1 {
+                        let s24 = read_i24(&mut reader)?;
+                        let s = dither_i24_to_i16(s24, &mut rng_l);
+                        interleaved.push(s);
+                        interleaved.push(s);
+                    } else {
+                        let l24 = read_i24(&mut reader)?;
+                        let r24 = read_i24(&mut reader)?;
+                        interleaved.push(dither_i24_to_i16(l24, &mut rng_l));
+                        interleaved.push(dither_i24_to_i16(r24, &mut rng_r));
+                        for _ in 2..fmt.num_channels {
+                            let _ = read_i24(&mut reader)?;
+                        }
+                    }
+                }
+                return Ok((CachedSample::from_pcm16_stereo(interleaved), metadata));
+            }
+
+            // Fallback: 24-bit (toggle off), 32-bit, or float — promote to f32.
+            let mut interleaved: Vec<f32> = Vec::with_capacity(total_frames * 2);
+            for _ in 0..total_frames {
+                let mut frame_samples = Vec::with_capacity(fmt.num_channels as usize);
+                for _ in 0..fmt.num_channels {
+                    let v = match (fmt.audio_format, fmt.bits_per_sample) {
+                        (1, 16) => (reader.read_i16::<LittleEndian>()? as f32) / I16_MAX_F,
+                        (1, 24) => (read_i24(&mut reader)? as f32) / I24_MAX_F,
+                        (1, 32) => (reader.read_i32::<LittleEndian>()? as f32) / I32_MAX_F,
+                        (3, 32) => reader.read_f32::<LittleEndian>()?,
+                        _ => 0.0,
+                    };
+                    frame_samples.push(v);
+                }
+                if fmt.num_channels == 1 {
+                    interleaved.push(frame_samples[0]);
+                    interleaved.push(frame_samples[0]);
+                } else {
+                    interleaved.push(frame_samples[0]);
+                    interleaved.push(frame_samples[1]);
+                }
+            }
+            Ok((CachedSample::from_f32_stereo(interleaved), metadata))
+        }
+        Err(e) if e.is::<IsWavPackError>() => {
+            // WavPack: route through the existing decoder. The decode path
+            // returns natively-channeled f32 in [-1, 1] and discards the
+            // source bit depth, so we can't losslessly recover i16. When
+            // `force_16bit_storage()` is on we apply the same dither policy
+            // as the 24-bit PCM path; otherwise we keep f32 to preserve
+            // bit-exactness for unknown-depth sources.
+            let (interleaved, meta) = load_sample_as_f32(path, target_sample_rate)?;
+            let chans = meta.channel_count as usize;
+            let stereo_f32: Vec<f32> = if chans == 2 {
+                interleaved
+            } else if chans == 1 {
+                let mut out = Vec::with_capacity(interleaved.len() * 2);
+                for s in interleaved {
+                    out.push(s);
+                    out.push(s);
+                }
+                out
+            } else {
+                let frames = interleaved.len() / chans;
+                let mut out = Vec::with_capacity(frames * 2);
+                for f in 0..frames {
+                    out.push(interleaved[f * chans]);
+                    out.push(interleaved[f * chans + 1]);
+                }
+                out
+            };
+
+            if crate::dither::force_16bit_storage() {
+                use crate::dither::{dither_i24_to_i16, seed_from_path, DitherRng};
+                let mut rng_l = DitherRng::new(seed_from_path(path));
+                let mut rng_r = DitherRng::new(
+                    seed_from_path(path).wrapping_add(0x9E37_79B9_7F4A_7C15),
+                );
+                let scale = I24_MAX_F - 1.0;
+                let mut pcm16: Vec<i16> = Vec::with_capacity(stereo_f32.len());
+                for pair in stereo_f32.chunks_exact(2) {
+                    let l24 = (pair[0].clamp(-1.0, 1.0) * scale) as i32;
+                    let r24 = (pair[1].clamp(-1.0, 1.0) * scale) as i32;
+                    pcm16.push(dither_i24_to_i16(l24, &mut rng_l));
+                    pcm16.push(dither_i24_to_i16(r24, &mut rng_r));
+                }
+                Ok((crate::sample_cache::CachedSample::from_pcm16_stereo(pcm16), meta))
+            } else {
+                Ok((
+                    crate::sample_cache::CachedSample::from_f32_stereo(stereo_f32),
+                    meta,
+                ))
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Checks and processes audio file. Supports WavPack input, always outputs WAV to cache.
 pub fn process_sample_file(
     relative_path: &Path,
