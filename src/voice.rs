@@ -16,7 +16,7 @@ use crate::wav_mmap::MmapSample;
 
 // Common Audio Constants
 pub const CHANNEL_COUNT: usize = 2;
-pub const VOICE_BUFFER_FRAMES: usize = 14400;
+pub const VOICE_BUFFER_FRAMES: usize = 4096;
 pub const CROSSFADE_TIME: f32 = 0.10;
 pub const VOICE_STEALING_FADE_TIME: f32 = 1.00;
 pub const MAX_NEW_VOICES_PER_BLOCK: usize = 28;

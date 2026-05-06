@@ -459,7 +459,42 @@ enable `convert_to_16bit`'s inverse, which lives in a different mechanism).
 
 ---
 
-## 11. Compressed in-RAM `sample_cache` (close the precache gap)
+## 11. Compressed in-RAM `sample_cache` (close the precache gap) — DONE
+
+**Fix shipped (commit 77c4684 + unstaged follow-ups):**
+
+- New `src/sample_cache.rs` with `CachedSample` enum (`F32` / `I16` /
+  `Compressed`) and `CachedPlayback` cursor mirroring `MmapPlayback`.
+  `BlockedPayload` reuses the on-disk sidecar layout in-RAM
+  (`frames_per_block = 4096`, block index doubles as seek checkpoints).
+- `Organ::sample_cache` now stores `Arc<CachedSample>` instead of
+  `Arc<Vec<f32>>`. `run_parallel_precache` builds via
+  `from_pcm16` / `from_pcm24_dithered` / `from_f32`, routing 24-bit
+  through the same dither path as `load_sample_head` when
+  `force_16bit_storage` is on.
+- `audio_loader.rs` fast-path drives a `CachedPlayback` cursor with the
+  same loop the mmap path uses. The legacy `samples_in_memory: Vec<f32>`
+  branch is gone.
+- `PreloadHead::Compressed` gains an eager-decode path so the warmup
+  worker decodes off-thread; the audio thread does a memcpy at
+  `Voice::new`. Eliminates the high-polyphony underrun.
+- `VOICE_BUFFER_FRAMES` reduced 14400 → 4096 (`src/voice.rs`). Saves
+  ~80 KB × polyphony. Verified no underruns under burst load with the
+  off-thread decode in place.
+- `MmapSample::open` gated `#[cfg(test)]` (`src/wav_mmap.rs`); production
+  code uses `open_with_sidecar_write`.
+- Tests added across `sample_cache`, `audio_loader`, `preload`, and
+  `voice` modules. All pass; release build clean.
+
+**Result:** precache path now stores compressed samples — 16-bit
+corpora drop ~50–60% vs the prior `Vec<f32>` layout, matching item 8's
+ratios. 24-bit corpora with `force_16bit_storage` enabled reach parity
+with native 16-bit. Audio-thread decode stall under burst polyphony is
+fixed.
+
+---
+
+## 11-historical. Original plan (kept for reference)
 
 **Problem:** when `precache=true`, `Organ::sample_cache` holds every
 unique sample as `Arc<Vec<f32>>` (`src/organ.rs:30`, populated by
@@ -756,7 +791,7 @@ supporting work or polish.
 | **8** | Audio-specific lossless codec for preload heads | Another ~1.5× on top of #7. Bigger change; do once #2's accounting can measure gains precisely. | **Done** |
 | **9** | Pre-compressed on-disk format for mmap attack samples | Halves page-cache footprint → fewer kernel evictions on phones. Reuses the codec from #8. | **Done** |
 | **10** | Skip 24-bit storage on mobile (dither to 16-bit) | Cheap once #9's sidecar machinery exists. Adds the 24-bit-corpus saving. | **Done** |
-| **11** | Compressed in-RAM `sample_cache` | Closes the precache gap — biggest remaining mobile-RAM win, also fixes the high-polyphony underrun by moving `Compressed` decode off the audio thread. | |
+| **11** | Compressed in-RAM `sample_cache` | Closes the precache gap — biggest remaining mobile-RAM win, also fixes the high-polyphony underrun by moving `Compressed` decode off the audio thread. | **Done** |
 | **3** | Voice count cap | Independent of the codec work. Verification + a small config knob. | |
 | **4** | Switch global allocator to jemalloc | Trivial code change but needs per-platform testing. Do once the structural work lands. | |
 | **5** | Mobile OS-level enforcement (cgroups / jetsam) | Packaging concern, not code. Final piece of the "guaranteed ceiling". | |
@@ -770,8 +805,7 @@ supporting work or polish.
 1. **Foundations** — #7 ✅, #2 ✅.
 2. **Latency cleanup** — #1 follow-up ✅ (`advise_will_need` + multi-threaded mmap warmup).
 3. **Big compression wins** — #8 ✅, #9 ✅, #10 ✅.
-4. **Close the precache gap** — #11 (the largest remaining mobile-RAM
-   win; also fixes the audio-thread decode stall under burst load).
+4. **Close the precache gap** — #11 ✅.
 5. **Polish & guardrails** — #3, #4, #5, #6.
 6. **CPU-side cleanup** — #12 (cheap), #14 (after #4), #13 (only if
    profiled).

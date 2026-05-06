@@ -69,6 +69,7 @@ impl MmapSample {
     /// WAV. Pure: never writes to disk. Use `open_with_sidecar_write` from
     /// the warmup worker to also generate the sidecar for next time.
     /// Errors out for sample-rate mismatch.
+    #[cfg(test)]
     pub fn open(path: &Path, target_sample_rate: u32) -> Result<Self> {
         let sidecar_path = path.with_extension("rpcs");
         let wav_mtime = sample_sidecar::wav_mtime_secs(path);
