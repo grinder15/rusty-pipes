@@ -99,27 +99,56 @@ phone genuinely caps the page-cache hit.
 
 ---
 
-## 3. Voice count cap
+## 3. Voice count cap — DONE
 
-**Today:** polyphony is bounded indirectly via voice-stealing in
-`enforce_voice_limit` (`src/audio_event.rs`), but each `Voice` carries a
-115 KB ring buffer (`VOICE_BUFFER_FRAMES * CHANNEL_COUNT * 4`). At peak
-polyphony with releases overlapping, this adds up.
+**Was:** `enforce_voice_limit` (`src/audio_event.rs`) ran *after* the
+note-on loop in the audio callback, so chord-burst note-ons overshot the
+cap before stealing reacted. The steal pool was also restricted to
+release voices (`!v.is_attack_sample`); attack-heavy bursts found zero
+stealable candidates and the cap was silently violated. Each `Voice`
+ring buffer is ~32 KB after item 11 (`VOICE_BUFFER_FRAMES = 4096`,
+`src/voice.rs`), so the cap matters for RAM as well as CPU.
 
-**Confirmed during item-1 testing:** with a 440-voice cap, fast bursts
-across many stops overshoot the cap visibly. `enforce_voice_limit` only
-considers attack voices older than 50 ms and ignores release voices
-entirely, so a burst spike (or many simultaneous releases) can sit well
-above the configured cap before stealing kicks in.
+**Fix shipped:**
 
-**Fix:** verify `enforce_voice_limit` is called early enough that voice
-count × 115 KB stays under a budget you set. If not, add a hard rejection
-of new voices once a soft cap is exceeded, with the same fade-steal
-behavior as today for the over-budget voices. Also include release
-voices in the accounting (or have a separate release-voice cap) so the
-cap reflects actual concurrent voices.
+- Refactored `enforce_voice_limit` (`src/audio_event.rs`) into three
+  helpers: `active_voice_count` (single source of truth — counts every
+  voice that isn't already fading out, attacks + releases alike),
+  `begin_steal` (sets `is_fading_out` + `fade_increment` from
+  `VOICE_STEALING_FADE_TIME`), and `steal_one_oldest` (picks the oldest
+  eligible voice). Eligibility excludes voices already fading out,
+  voices blocking on a pending release sample
+  (`is_awaiting_release_sample`), and voices younger than 50 ms.
+  `steal_one_oldest` prefers releases over attacks but **falls back to
+  attacks** when no releases are eligible — fixing the chord-burst
+  overshoot. `enforce_voice_limit` loops on `steal_one_oldest` until the
+  cap is met or no candidates remain.
+- Audio-callback ordering changed in `src/audio.rs`:
+  `enforce_voice_limit` now runs **before** the `process_note_on` loop
+  in addition to the existing post-loop call. Pre-loop stealing frees
+  slots from the prior block before this block tries to insert.
+- Insertion-time hard cap added in `process_note_on`
+  (`src/audio_event.rs`): a new `polyphony: usize` parameter is checked
+  before each per-rank `voices.insert` call. If the cap is reached, an
+  inline `steal_one_oldest` attempt runs; if that fails (all voices
+  younger than 50 ms), the new voice is dropped on the floor with a
+  `debug!` log and the loop `continue`s — no orphan in `active_notes`.
+- Tests added in `audio_event::tests` (5):
+  `active_voice_count_excludes_fading_out`,
+  `enforce_voice_limit_steals_oldest_release_first`,
+  `enforce_voice_limit_falls_back_to_attack_when_no_releases`,
+  `enforce_voice_limit_respects_50ms_minimum_age`,
+  `enforce_voice_limit_steals_multiple_to_reach_cap`. All 78 tests
+  pass; release build clean.
 
-**Estimated effort:** small — mostly verification and a config knob.
+**Result:** the polyphony slider is now a hard ceiling. At burst peaks
+the cap is honoured at insertion time (rejecting rather than
+overshooting); steady-state stealing works on both attacks and
+releases, so attack-heavy bursts no longer slip past. No new config
+knob — single `AppSettings::polyphony` covers attacks + releases.
+
+**Out of scope:** separate attack/release sub-caps; per-rank
+polyphony; CLI `--polyphony` flag (no settings have one today).
 
 ---
 
@@ -778,6 +807,203 @@ file-backed RSS already plateaus where expected.
 
 ---
 
+## 15. Strict `max_ram_gb` enforcement — GrandOrgue-style streaming completion (NEXT PRIORITY)
+
+**Symptom (observed 2026-05-06, polyphony=440, `precache=false`,
+`force_16bit=false`, `max_ram_gb=0.5`):** RSS climbs to ~1.2 GB at
+10 stops and ~1.8 GB at 13–14 stops, well past the 500 MB cap.
+Glitching on faster passages on ALSA at 13–14 stops; JACK clean until
+similar load. The cap is being violated even though precache is off.
+
+**Root-cause analysis (audited `src/audio_loader.rs`,
+`src/organ.rs:143–342`, `src/warmup.rs`, `src/audio_event.rs`):** the
+lazy path is *almost* GO-style streaming already — attack mmap fast
+path (`audio_loader.rs:33`, `run_mmap_playback`) streams from the
+page cache, releases get preload heads via the WarmPool, slow-path
+one-shot releases stream via `WavSampleReader`. The pieces that leak
+past the budget:
+
+1. **`decoder.collect()` escape hatch** (`audio_loader.rs:117`).
+   When `WarmPool` admission fails (budget full + everything
+   pinned) so a looping attack has no `MmapSample`, the slow path
+   loads the entire WAV into `samples_in_memory: Vec<f32>`. This Vec
+   is **not counted by `WarmPool`** — every voice spawn for a
+   non-admitted looping pipe allocates a full sample copy in RAM.
+   Under heavy stop-on (many pipes pinned simultaneously), this is
+   the dominant overshoot source.
+2. **Releases never get mmap'd.** `WarmPool` has no
+   `admit_release_mmap`; releases without a preload head open a
+   fresh `File` per note-off (`audio_loader.rs:83`) and stream
+   through `BufReader`. Functionally fine, but: extra `File::open`
+   latency per note-off, and any release that ever turns out to
+   carry loop info would also hit the `decoder.collect()` path.
+3. **Pinning makes admission unbreakable, not the cap.** When all
+   `WarmPool` entries are pinned by active voices, `admit()`
+   correctly returns `false`. But fix #1 makes that the silent
+   fallback — instead of degrading to streaming, we explode RAM.
+
+The polyphony counter shown in the TUI also misreports under stealing
+load: `audio.rs:708` sends `voices.len()` (which includes
+`is_fading_out` voices lingering for up to `VOICE_STEALING_FADE_TIME = 1.00s`)
+instead of `active_voice_count(&voices)` (the value the cap actually
+enforces). This is a display bug, not a cap violation, but caused
+confusion during the 2026-05-06 test session.
+
+### GrandOrgue reference architecture
+
+GO splits each pipe into attack-head (RAM, small) + sustain (mmap or
+RAM-resident loop region) + release (preload head + streamed tail),
+with a per-voice decode-ahead ring fed by an I/O thread. RAM is
+bounded because the only persistent allocations are admission-
+controlled. GO exposes load modes *full / lazy / streamed*; we want
+parity with their *streamed* mode for the lazy path while keeping
+*full* (precache) and *lazy* selectable.
+
+### Approach
+
+Stay within the existing `WarmPool` + `MmapSample` + `WavSampleReader`
+architecture — no rewrite. Plug the three leaks above.
+
+#### 15a. Replace `decoder.collect()` for looping attacks with seeking-stream
+
+In `audio_loader.rs`, the slow-path branch for looping attacks
+(currently `samples_in_memory = decoder.collect()` at line 117) must
+become a streaming loop that seeks the underlying `BufReader` back to
+the loop-start byte offset when the cursor crosses loop-end. The
+mmap path already does this via a frame cursor (`run_mmap_playback`,
+`audio_loader.rs:401–411`); replicate the same logic on top of
+`WavSampleReader`.
+
+Implementation sketch:
+
+- `WavSampleReader` exposes the file `data_start` byte offset (or
+  add a method). On loop wrap, `reader.seek(SeekFrom::Start(data_start + loop_start_frame * frame_bytes))`.
+- Reuse the existing 1024-frame `interleaved_buffer` chunk loop
+  (`audio_loader.rs:160–249`) — only the looping branch changes.
+- Drop `samples_in_memory` and the `use_memory_reader` flag entirely.
+
+#### 15b. Add release-sample mmap entries to `WarmPool`
+
+Mirror the attack-mmap path for releases:
+
+- `WarmPool::admit_release_mmap(path, slot, bytes) -> bool` (or reuse
+  `admit_mmap` with a kind tag — `WarmKind::ReleaseMmap`). Same LRU,
+  same global byte budget, same eviction across all kinds.
+- `Pipe::release_mmap_slot: Vec<Arc<ArcSwapOption<MmapSample>>>` per
+  release (or fold into the existing release struct alongside
+  `preloaded_bytes`).
+- Warmup worker: when admitting a release preload head succeeds and
+  there's residual budget, also enqueue a `MmapAttack`-equivalent
+  `MmapRelease` job. Best-effort — rejected admissions drop to
+  streaming.
+- `audio_loader.rs`: when a release `SpawnJob` carries an
+  `Arc<MmapSample>`, route through `run_mmap_playback` instead of
+  the disk path. Removes the per-note-off `File::open`.
+
+#### 15c. Strict accounting test + budget invariant
+
+Add a debug-only assertion in `WarmPool::admit` that
+`current_bytes == sum(preload_lru.values().bytes) + sum(mmap_lru.values().bytes)`.
+Catches future leaks where someone forgets to update `current_bytes`.
+
+#### 15d. Fix polyphony counter display (cosmetic, ship with this work)
+
+`src/audio.rs:708`: replace
+
+```rust
+let current_voice_count = voices.len();
+```
+
+with
+
+```rust
+let current_voice_count = active_voice_count(&voices);
+```
+
+(or expose both — "active / total" — if the lingering fade-out count
+is informative). The cap value reported to the user matches what
+the cap enforces.
+
+### Files to modify
+
+- `src/audio_loader.rs` — kill the `decoder.collect()` branch
+  (~60 lines changed); add release-mmap routing (~40 lines).
+- `src/wav.rs` / `src/wav_mmap.rs` — expose `data_start` byte offset
+  on `WavSampleReader` for the seek-on-loop logic (~10 lines).
+- `src/organ.rs` — extend `WarmPool` with release-mmap kind /
+  pinning. If keeping a single `mmap_lru`, the Pipe path-key already
+  disambiguates; if separating, add `release_mmap_lru` (~50 lines).
+- `src/warmup.rs` — `WarmupJob::MmapRelease` arm (~30 lines),
+  enqueue from `enqueue_stop_warmup`.
+- `src/audio_event.rs` — `process_note_off` passes the release
+  `MmapSample` (if any) into the `SpawnJob` (~20 lines).
+- `src/voice.rs` — `SpawnJob` already carries `mmap: Option<Arc<MmapSample>>`
+  for attacks; reuse it for releases (no struct change needed).
+- `src/audio.rs` — one-line polyphony counter fix.
+
+### Tests
+
+- `audio_loader::seeking_stream_loops_attack_without_full_load` —
+  drive a synthetic looping WAV through the slow path, assert no
+  allocation > 1024 frames × 2 ch × 4 B during playback.
+- `warm_pool::admit_release_mmap_evicts_oldest_unpinned_globally` —
+  same shape as the existing mmap admission test.
+- `audio_loader::release_uses_mmap_when_available` — assert release
+  spawn with `mmap.is_some()` takes the mmap path.
+- `audio_event::release_with_mmap_does_not_open_file` — fixture
+  with a tracked `File::open` count.
+- `warm_pool::strict_accounting_invariant_holds_after_random_ops` —
+  property-style test: random admit / evict / pin / unpin sequences,
+  assert `current_bytes` matches the LRU sum at every step.
+
+### Verification (manual, post-commit)
+
+Reproduces the 2026-05-06 test conditions:
+
+1. `max_ram_gb = 0.5`, `polyphony = 440`, `precache = false`,
+   `force_16bit = false`, JACK + ALSA backends.
+2. 2 stops → RSS plateaus at ≤ 500 MB. (Already passes today.)
+3. 10 stops, busy chord work → RSS plateaus at ≤ 500 MB. (Today
+   reaches ~1.2 GB.)
+4. 13–14 stops, fast passages → RSS plateaus at ≤ 500 MB. ALSA
+   should glitch *less* once the `decoder.collect()` allocs stop;
+   any remaining glitches are voice-mixing CPU, not RAM-driven.
+5. TUI polyphony counter never exceeds 440 even during heavy
+   stealing.
+
+### Expected RAM impact
+
+For the 2026-05-06 test corpus at 14 stops:
+
+- Before: ~1.8 GB (~3.6× over 500 MB cap).
+- After: ≤ 500 MB + per-voice ring overhead (~14 MB at polyphony 440)
+  + GUI / FFT / metadata (~tens of MB). Strict cap honoured even
+  with all stops pinned.
+
+### Out of scope
+
+- Strict cap on the `precache=true` path (`Organ::sample_cache`
+  HashMap unbounded — separate item, harder because precache mode
+  *is* "load everything"; would require LRU-on-cache-miss with disk
+  fallback, effectively converting precache to a warm hint).
+- Per-voice decode-ahead ring resizing — current 4096-frame
+  buffer is small enough; tune only if profiling shows underruns.
+- IR mmap for the convolver (separate workstream — see #13).
+- CPU-side glitching at 14 stops (likely voice-mixing throughput,
+  not addressed by this item).
+
+### Estimated effort
+
+A focused session of code changes (~300–400 lines) plus a round of
+manual ALSA/JACK testing. The only structural complexity is the
+seek-on-loop logic in 15a — `BufReader` state must be managed
+correctly across the seek, and the existing tests don't cover
+streaming-loop wraparound on the slow path.
+
+### Status: NEW — top of the queue after item #3
+
+---
+
 ## Suggested ordering
 
 Items 7+8 are the biggest mobile-RAM wins; everything else is
@@ -792,7 +1018,8 @@ supporting work or polish.
 | **9** | Pre-compressed on-disk format for mmap attack samples | Halves page-cache footprint → fewer kernel evictions on phones. Reuses the codec from #8. | **Done** |
 | **10** | Skip 24-bit storage on mobile (dither to 16-bit) | Cheap once #9's sidecar machinery exists. Adds the 24-bit-corpus saving. | **Done** |
 | **11** | Compressed in-RAM `sample_cache` | Closes the precache gap — biggest remaining mobile-RAM win, also fixes the high-polyphony underrun by moving `Compressed` decode off the audio thread. | **Done** |
-| **3** | Voice count cap | Independent of the codec work. Verification + a small config knob. | |
+| **3** | Voice count cap | Independent of the codec work. Verification + a small config knob. | **Done** |
+| **15** | Strict `max_ram_gb` enforcement (GO-style streaming completion) | **Top priority** — observed cap violation 2026-05-06 (1.8 GB at 14 stops vs 500 MB cap). Plugs three leaks: `decoder.collect()` fallback, release mmap, polyphony display. | **NEXT** |
 | **4** | Switch global allocator to jemalloc | Trivial code change but needs per-platform testing. Do once the structural work lands. | |
 | **5** | Mobile OS-level enforcement (cgroups / jetsam) | Packaging concern, not code. Final piece of the "guaranteed ceiling". | |
 | **6** | UI label tweak for the slider | Cosmetic. Anytime convenient. | |
@@ -806,7 +1033,7 @@ supporting work or polish.
 2. **Latency cleanup** — #1 follow-up ✅ (`advise_will_need` + multi-threaded mmap warmup).
 3. **Big compression wins** — #8 ✅, #9 ✅, #10 ✅.
 4. **Close the precache gap** — #11 ✅.
-5. **Polish & guardrails** — #3, #4, #5, #6.
+5. **Polish & guardrails** — #3 ✅, **#15 (next)**, #4, #5, #6.
 6. **CPU-side cleanup** — #12 (cheap), #14 (after #4), #13 (only if
    profiled).
 

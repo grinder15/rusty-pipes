@@ -39,40 +39,75 @@ fn ensure_pipe_mmap(
     None
 }
 
-/// If voice limit is exceeded, this finds the oldest *release* samples
-/// and forces them to fade out quickly.
-pub fn enforce_voice_limit(voices: &mut HashMap<u64, Voice>, sample_rate: u32, polyphony: usize) {
-    let active_musical_voices = voices.values().filter(|v| !v.is_fading_out).count();
+/// Count voices that contribute to the polyphony budget. A voice already
+/// fading out has freed its budget slot conceptually — it will be reaped
+/// soon — so we exclude it here. Both attacks and releases are counted.
+fn active_voice_count(voices: &HashMap<u64, Voice>) -> usize {
+    voices.values().filter(|v| !v.is_fading_out).count()
+}
 
-    if active_musical_voices <= polyphony {
-        return;
+const STEAL_MIN_AGE: Duration = Duration::from_millis(50);
+
+/// Mark `voice` as fading out at `VOICE_STEALING_FADE_TIME`.
+fn begin_steal(voice: &mut Voice, sample_rate: u32) {
+    voice.is_fading_out = true;
+    voice.is_fading_in = false;
+    let steal_fade_frames = (sample_rate as f32 * VOICE_STEALING_FADE_TIME) as usize;
+    voice.fade_increment = if steal_fade_frames > 0 {
+        1.0 / steal_fade_frames as f32
+    } else {
+        1.0
+    };
+}
+
+/// Pick the oldest stealable voice and start its fade-out. Returns `true`
+/// if a voice was stolen. Prefers release voices over attacks (releases
+/// are usually less audible to drop), and within each class picks the
+/// oldest. Voices younger than `STEAL_MIN_AGE`, already fading out, or
+/// blocking on a pending release are excluded.
+fn steal_one_oldest(voices: &mut HashMap<u64, Voice>, sample_rate: u32) -> bool {
+    let mut oldest_release: Option<(u64, Instant)> = None;
+    let mut oldest_attack: Option<(u64, Instant)> = None;
+
+    for (id, v) in voices.iter() {
+        if v.is_fading_out || v.is_awaiting_release_sample {
+            continue;
+        }
+        if v.note_on_time.elapsed() <= STEAL_MIN_AGE {
+            continue;
+        }
+        let slot = if v.is_attack_sample {
+            &mut oldest_attack
+        } else {
+            &mut oldest_release
+        };
+        match slot {
+            Some((_, t)) if *t <= v.note_on_time => {}
+            _ => *slot = Some((*id, v.note_on_time)),
+        }
     }
 
-    let voices_to_steal = active_musical_voices - polyphony;
-    let min_age = Duration::from_millis(50);
-
-    let mut candidates: Vec<(u64, Instant)> = voices
-        .iter()
-        .filter(|(_, v)| {
-            !v.is_attack_sample && !v.is_fading_out && v.note_on_time.elapsed() > min_age
-        })
-        .map(|(id, v)| (*id, v.note_on_time))
-        .collect();
-
-    candidates.sort_by_key(|(_, time)| *time);
-
-    for (voice_id, _) in candidates.iter().take(voices_to_steal) {
-        if let Some(voice) = voices.get_mut(voice_id) {
+    let pick = oldest_release.or(oldest_attack);
+    if let Some((voice_id, _)) = pick {
+        if let Some(voice) = voices.get_mut(&voice_id) {
             log::warn!("[AudioThread] Stealing Voice ID {}", voice_id);
-            voice.is_fading_out = true;
-            voice.is_fading_in = false;
+            begin_steal(voice, sample_rate);
+            return true;
+        }
+    }
+    false
+}
 
-            let steal_fade_frames = (sample_rate as f32 * VOICE_STEALING_FADE_TIME) as usize;
-            voice.fade_increment = if steal_fade_frames > 0 {
-                1.0 / steal_fade_frames as f32
-            } else {
-                1.0
-            };
+/// Bring the active-voice count down to `polyphony` by stealing the oldest
+/// eligible voices. Releases are stolen first; if the cap is still
+/// exceeded, oldest attacks are stolen too. If no voice is old enough to
+/// steal (all younger than `STEAL_MIN_AGE`), enforcement bails — the next
+/// audio block will retry, and the insertion-time check in
+/// `process_note_on` provides the hard backstop.
+pub fn enforce_voice_limit(voices: &mut HashMap<u64, Voice>, sample_rate: u32, polyphony: usize) {
+    while active_voice_count(voices) > polyphony {
+        if !steal_one_oldest(voices, sample_rate) {
+            break;
         }
     }
 }
@@ -177,6 +212,7 @@ pub fn process_note_on(
     voice_counter: &mut u64,
     stop_map: &HashMap<String, usize>,
     sample_rate: u32,
+    polyphony: usize,
     spawner_tx: &mpsc::Sender<SpawnJob>,
     warmup_tx: Option<&WarmupSender>,
 ) {
@@ -189,6 +225,23 @@ pub fn process_note_on(
             for rank_id in &stop.rank_ids {
                 if let Some(rank) = organ.ranks.get(rank_id) {
                     if let Some(pipe) = rank.pipes.get(&note) {
+                        // Hard cap: if we're already at the polyphony budget,
+                        // try to free a slot by stealing the oldest eligible
+                        // voice. If nothing is old enough to steal, drop this
+                        // new voice on the floor — under burst load that's
+                        // preferable to overshooting RAM/CPU.
+                        if active_voice_count(voices) >= polyphony {
+                            if !steal_one_oldest(voices, sample_rate) {
+                                log::debug!(
+                                    "[AudioThread] Polyphony cap {} reached; dropping note {} on rank {}",
+                                    polyphony,
+                                    note,
+                                    rank_id
+                                );
+                                continue;
+                            }
+                        }
+
                         let total_gain = rank.gain_db + pipe.gain_db;
 
                         // Bump LRU recency for the touched pipe.
@@ -473,5 +526,97 @@ pub fn process_message(
             let _ = tui_tx.send(TuiMessage::ForceClose);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::voice::{CHANNEL_COUNT, Voice};
+    use ringbuf::HeapRb;
+    use ringbuf::traits::Split;
+    use std::sync::atomic::AtomicBool;
+
+    fn make_voice(is_attack: bool, age: Duration) -> Voice {
+        let rb = HeapRb::<f32>::new(2 * CHANNEL_COUNT);
+        let (_producer, consumer) = rb.split();
+        Voice {
+            gain: 1.0,
+            consumer,
+            is_finished: Arc::new(AtomicBool::new(false)),
+            is_cancelled: Arc::new(AtomicBool::new(false)),
+            fade_level: 1.0,
+            is_fading_out: false,
+            is_fading_in: false,
+            is_awaiting_release_sample: false,
+            release_voice_id: None,
+            note_on_time: Instant::now() - age,
+            is_attack_sample: is_attack,
+            fade_increment: 0.0,
+            windchest_group_id: None,
+            input_buffer: Vec::new(),
+            buffer_start_idx: 0,
+            cursor_pos: 0.0,
+            _pin: None,
+        }
+    }
+
+    #[test]
+    fn active_voice_count_excludes_fading_out() {
+        let mut voices: HashMap<u64, Voice> = HashMap::new();
+        voices.insert(1, make_voice(true, Duration::from_millis(100)));
+        let mut fading = make_voice(false, Duration::from_millis(100));
+        fading.is_fading_out = true;
+        voices.insert(2, fading);
+        voices.insert(3, make_voice(false, Duration::from_millis(100)));
+        assert_eq!(active_voice_count(&voices), 2);
+    }
+
+    #[test]
+    fn enforce_voice_limit_steals_oldest_release_first() {
+        let mut voices: HashMap<u64, Voice> = HashMap::new();
+        voices.insert(1, make_voice(false, Duration::from_millis(200))); // oldest release
+        voices.insert(2, make_voice(false, Duration::from_millis(100)));
+        voices.insert(3, make_voice(true, Duration::from_millis(150))); // attack — should not be touched
+        enforce_voice_limit(&mut voices, 48000, 2);
+        assert!(voices.get(&1).unwrap().is_fading_out);
+        assert!(!voices.get(&2).unwrap().is_fading_out);
+        assert!(!voices.get(&3).unwrap().is_fading_out);
+    }
+
+    #[test]
+    fn enforce_voice_limit_falls_back_to_attack_when_no_releases() {
+        let mut voices: HashMap<u64, Voice> = HashMap::new();
+        voices.insert(1, make_voice(true, Duration::from_millis(200))); // oldest attack
+        voices.insert(2, make_voice(true, Duration::from_millis(100)));
+        enforce_voice_limit(&mut voices, 48000, 1);
+        assert!(voices.get(&1).unwrap().is_fading_out);
+        assert!(!voices.get(&2).unwrap().is_fading_out);
+    }
+
+    #[test]
+    fn enforce_voice_limit_respects_50ms_minimum_age() {
+        let mut voices: HashMap<u64, Voice> = HashMap::new();
+        voices.insert(1, make_voice(false, Duration::from_millis(10)));
+        voices.insert(2, make_voice(false, Duration::from_millis(20)));
+        voices.insert(3, make_voice(true, Duration::from_millis(5)));
+        enforce_voice_limit(&mut voices, 48000, 1);
+        // All voices are younger than 50 ms — none can be stolen, so the
+        // soft limit yields without touching them. The hard backstop in
+        // `process_note_on` is what prevents new insertions in this state.
+        assert!(!voices.get(&1).unwrap().is_fading_out);
+        assert!(!voices.get(&2).unwrap().is_fading_out);
+        assert!(!voices.get(&3).unwrap().is_fading_out);
+    }
+
+    #[test]
+    fn enforce_voice_limit_steals_multiple_to_reach_cap() {
+        let mut voices: HashMap<u64, Voice> = HashMap::new();
+        for i in 0..5u64 {
+            voices.insert(i, make_voice(false, Duration::from_millis(100 + i * 10)));
+        }
+        enforce_voice_limit(&mut voices, 48000, 2);
+        let active = active_voice_count(&voices);
+        assert_eq!(active, 2, "should steal down to exactly the cap");
     }
 }

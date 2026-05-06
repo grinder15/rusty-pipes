@@ -351,6 +351,12 @@ fn spawn_audio_processing_thread<P>(
                 }
             }
 
+            // Pre-loop steal pass: free up slots from the prior block before
+            // we try to insert this block's note-ons. The post-loop call
+            // below remains as a backstop for releases that have just been
+            // promoted from `is_awaiting_release_sample`.
+            enforce_voice_limit(&mut voices, sample_rate, polyphony);
+
             // Throttle Note Ons
             let mut new_voice_count = 0;
             while new_voice_count < max_new_voices_per_block {
@@ -363,6 +369,7 @@ fn spawn_audio_processing_thread<P>(
                         &mut voice_counter,
                         &stop_name_to_index_map,
                         sample_rate,
+                        polyphony,
                         &spawner_tx,
                         warmup_tx.as_ref(),
                     );
